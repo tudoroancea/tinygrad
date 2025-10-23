@@ -109,20 +109,30 @@ pm_apply_rangeify = PatternMatcher([
   (UPat((Ops.CONST, Ops.DEFINE_VAR), name="c"), lambda ctx,c: c.replace(src=()) if c in ctx.range_map else None),
 ])
 
+# Helper function to canonicalize shape elements that might be RANGE ops
+def canonicalize_shape_element(s:sint) -> sint:
+  """Extract the size from a shape element. If it's a RANGE op, return its size (src[0]), otherwise return as-is."""
+  if isinstance(s, UOp) and s.op is Ops.RANGE:
+    return s.src[0]
+  return s
+
 # this is the definition of the movement ops
 @functools.cache
 def apply_movement_op(op:Ops, in_shape:tuple[sint,...], arg:tuple, rngs:tuple[UOp, ...]) -> tuple[UOp, ...]:
+  # Canonicalize in_shape to handle RANGE ops
+  canon_shape = tuple(canonicalize_shape_element(s) for s in in_shape)
+
   match op:
     case Ops.SHRINK:  rngs = tuple(a if ss == 0 else a+ss for a,(ss,_) in zip(rngs, arg))
     case Ops.PERMUTE: rngs = tuple(rngs[p] for p in argsort(arg))
-    case Ops.FLIP:    rngs = tuple(((s-1)-a) if f else a for a,s,f in zip(rngs, in_shape, arg))
-    case Ops.EXPAND:  rngs = tuple(a if in_sh == out_sh else a.const_like(0) for a,in_sh,out_sh in zip(rngs, in_shape, arg))
+    case Ops.FLIP:    rngs = tuple(((s-1)-a) if f else a for a,s,f in zip(rngs, canon_shape, arg))
+    case Ops.EXPAND:  rngs = tuple(a if in_sh == out_sh else a.const_like(0) for a,in_sh,out_sh in zip(rngs, canon_shape, arg))
     case Ops.PAD:
       # TODO: why is multiple graph_rewrites faster than one here?
       # TODO: the .where(r-s, i) is not inside the graph_rewrite so that `convert_pad_to_where_to_keep_behavior_local`
       #       wraps the pad with only the newly added valid
       rngs = tuple(r if (s == 0 and e == 0) else graph_rewrite(((r >= s) & (r < (sh+s))),
-        symbolic+pm_simplify_valid, name="pad").where(r-s, UOp.invalid()) for r,sh,(s,e) in zip(rngs, in_shape, arg))
+        symbolic+pm_simplify_valid, name="pad").where(r-s, UOp.invalid()) for r,sh,(s,e) in zip(rngs, canon_shape, arg))
     case Ops.RESHAPE:
       acc = 1
       axes_in:list[UOp] = []
@@ -131,7 +141,7 @@ def apply_movement_op(op:Ops, in_shape:tuple[sint,...], arg:tuple, rngs:tuple[UO
         acc *= s
       combined_axes = sum(axes_in, start=UOp.const(dtypes.index, 0))
       axes_out:list[UOp] = []
-      for s in in_shape[::-1]:
+      for s in canon_shape[::-1]:
         axes_out.append(combined_axes % s)
         combined_axes //= s
       # this simplify is doing a lot of heavy lifting. this is the replacement for the reshape view merging code

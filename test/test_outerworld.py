@@ -70,5 +70,46 @@ class TestOuterworld(unittest.TestCase):
     out = out.reshape(1, 3).expand(a, 3).contiguous().realize()
     self.assertListEqual([[0,4,8],[4,8,12],[8,12,16]], out.tolist())
 
+  def test_indexing_after_vmap(self):
+    # Test: after vmapping, do additional fancy indexing
+    x = Tensor.arange(24).reshape(4, 6).contiguous()
+
+    # vmap across axis 0
+    a = UOp.range(4, -1)
+    vmapped = x[a]  # shape should be (6,) but with outerworld range
+
+    # Now do fancy indexing on the vmapped result
+    indices = Tensor([0, 2, 4])
+    result = vmapped[indices]  # Select elements 0, 2, 4 from each row
+
+    # Expand back to get the full result
+    result = result.reshape(1, 3).expand(a, 3).contiguous().realize()
+
+    # Expected: [[0,2,4], [6,8,10], [12,14,16], [18,20,22]]
+    expected = [[0, 2, 4], [6, 8, 10], [12, 14, 16], [18, 20, 22]]
+    self.assertListEqual(result.tolist(), expected)
+
+  def test_flat_indexing_after_vmap(self):
+    # Test: after vmapping, reshape then do flat indexing
+    x = Tensor.arange(24).reshape(4, 2, 3).contiguous()
+
+    # vmap across axis 0
+    a = UOp.range(4, -1)
+    vmapped = x[a]  # shape should be (2, 3) but with outerworld range
+
+    # Flatten the vmapped tensor - this requires computing prod(shape)
+    # which is tricky when shape contains RANGE ops
+    flattened = vmapped.flatten()  # Should be shape (6,)
+
+    # Now do flat indexing
+    result = flattened[3]  # Get element at flat position 3
+
+    # Expand back to get the full result
+    result = result.reshape(1).expand(a).contiguous().realize()
+
+    # Expected: [3, 9, 15, 21] (element at flat position 3 of each 2x3 slice)
+    expected = [3, 9, 15, 21]
+    self.assertListEqual(result.tolist(), expected)
+
 if __name__ == '__main__':
   unittest.main()
