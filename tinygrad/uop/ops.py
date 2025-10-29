@@ -241,7 +241,7 @@ class UOp(MathMixin, MovementMixin, metaclass=UOpMetaClass):
           if prod(ps) != prod(self.marg): raise ValueError(f"bad reshape: {ps} -> {self.marg}")
           return self.marg
         case Ops.EXPAND:
-          if len(ps) != len(self.marg) or not all(s==ns or (s==1 and ns>=0) for s,ns in zip(ps, self.marg)):
+          if len(ps) != len(self.marg) or any(resolve(s!=ns) and (resolve(s!=1) or resolve(ns<0)) for s,ns in zip(ps, self.marg)):
             raise ValueError(f"bad expand: {ps} -> {self.marg}")
           return self.marg
         case Ops.PERMUTE:
@@ -321,7 +321,7 @@ class UOp(MathMixin, MovementMixin, metaclass=UOpMetaClass):
     assert isinstance(vmin, expected_type), f"vmin is wrong dtype {type(vmin)} != {expected_type}"
     return vmin
   def __bool__(self): return self._eval((dtypes.bool,), bool)
-  def __int__(self): return self._eval(dtypes.ints, int)
+  def __int__(self): return self._eval(dtypes.ints+(dtypes.index,), int)
   def __float__(self): return self._eval(dtypes.floats, float)
   def substitute(self, dvars:dict[UOp, UOp], name:str|None=None, extra_pm:PatternMatcher|None=None):
     dvars = {k:v for k,v in dvars.items() if k is not v}
@@ -746,7 +746,7 @@ class UOp(MathMixin, MovementMixin, metaclass=UOpMetaClass):
     # NOTE: returned UOp is assumed to be CONST
     if self.op is Ops.DEFINE_VAR and self.arg: return self.arg[1], self.arg[2]
     if self.op in (Ops.RANGE, Ops.SPECIAL): return 0, (self.src[0]-1).vmax
-    if self.op is Ops.BIND: return self.src[0]._min_max # ignore the bound value
+    if self.op is Ops.BIND: return self.src[1]._min_max
     if self.op in {Ops.UNROLL, Ops.VECTORIZE}: return min(x.vmin for x in self.src), max(x.vmax for x in self.src)
     if self.op is Ops.CONST and self.arg is not Invalid: return self.arg, self.arg
     if self.op is Ops.VCONST and Invalid not in self.arg: return (min(self.arg), max(self.arg))
