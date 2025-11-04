@@ -22,24 +22,35 @@ class TestVmap(unittest.TestCase):
 
   def test_vmap(self):
     x = UOp.new_buffer("CPU", 18, dtypes.float, 0).reshape((3,6))
-    rm1 = UOp.range(3,-1)
+    varg = (UOp.range(3,-1), UOp.const(dtypes.index, 0))
     a = UOp.new_buffer("CPU", 6, dtypes.float, 1)
-    c0 = x.vmapin((rm1, rm1.const_like(0)))
+    c0 = x.vmapin(varg)
     c1 = c0 * a
-    c2 = c1.vmapout((rm1, rm1.const_like(0)))
+    c2 = c1.vmapout(varg)
     ast = c2.contiguous()
     Tensor(ast, "CPU").schedule()
 
-  def test_reshape_after_vmap(self):
-    x = UOp.new_buffer("CPU", 18, dtypes.float, 0).reshape((3,6))
-    rm1 = UOp.range(3,-1)
+  def test_vmap_dim1(self):
+    x = UOp.new_buffer("CPU", 6, dtypes.float, 0).reshape((1,6))
+    varg = (UOp.range(1,-1), UOp.const(dtypes.index, 0))
     a = UOp.new_buffer("CPU", 6, dtypes.float, 1)
-    c0 = x.vmapin((rm1, rm1.const_like(0)))
+    c0 = x.vmapin(varg)
     c1 = c0 * a
-    c2 = c1.vmapout((rm1, rm1.const_like(0)))
-    ast = c2.reshape(9,2).contiguous()
+    c2 = c1.vmapout(varg)
+    ast = c2.contiguous()
     Tensor(ast, "CPU").schedule()
 
+  def test_multiple_consumers(self):
+    x = UOp.new_buffer("CPU", 18, dtypes.float, 0).reshape((3,6))
+    varg = (UOp.range(3,-1), UOp.const(dtypes.index, 0))
+    a = UOp.new_buffer("CPU", 6, dtypes.float, 1)
+    b = UOp.new_buffer("CPU", 6, dtypes.float, 1).reshape((3,2))
+    c0 = x.vmapin(varg)
+    c1 = c0 * a
+    c2 = (c0.reshape((3,2)) * b).reshape((6,))
+    ast0 = c1.vmapout(varg).contiguous()
+    ast1 = (c1+c2).vmapout(varg).contiguous()
+    Tensor.schedule(Tensor(ast0, "CPU"),Tensor(ast1, "CPU"))
 
 class TestAfterVmap(unittest.TestCase):
   n,m = 3,6

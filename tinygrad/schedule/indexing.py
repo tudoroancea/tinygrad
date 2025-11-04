@@ -254,12 +254,10 @@ def run_rangeify(tsink:UOp, debug:bool=False) -> tuple[UOp, IndexingContext]:
         if a.op == Ops.RANGE:
           rngs.insert(i, a)
       rngs = tuple(rngs)
-      print("VMAPIN ranges:", tuple(r.render() for r in rngs), tuple(r.render() for r in out_rngs))
     elif x.op == Ops.VMAPOUT:
       # remove outerworld ranges
       assert len(x.src[0].shape) == x.arg.count(UOp.const(dtypes.index, 0))
       rngs = tuple(r for a,r in zip(x.arg, out_rngs) if a.op == Ops.CONST)
-      print("VMAPOUT ranges:", tuple(r.render() for r in rngs), tuple(r.render() for r in out_rngs))
 
     # REDUCE_AXIS creates ranges for the axes it is reducing
     if x.op is Ops.REDUCE_AXIS:
