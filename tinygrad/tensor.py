@@ -1036,6 +1036,10 @@ class Tensor(MathMixin, MovementMixin):
       t.grad = g if t.grad is None else (t.grad + g)
     return self
 
+  # ***** vmapping ops *****
+  def vmapin(self, arg: tuple[UOp,...])->Tensor: return self._apply_uop(UOp.vmapin, arg=arg)
+  def vmapout(self, arg:tuple[UOp, ...])->Tensor: return self._apply_uop(UOp.vmapout, arg=arg)
+
   # ***** movement low level ops *****
 
   def _mop(self, op:Ops, arg) -> Tensor: return self._apply_uop(UOp._mop, extra_args=(op,), arg=arg)

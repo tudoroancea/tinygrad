@@ -109,6 +109,11 @@ _tensor_spec = PatternMatcher([
 
   # AFTER if things were kernelized
   (UPat(Ops.AFTER, src=(UPat((Ops.BUFFER, Ops.AFTER)),), allow_any_len=True), lambda: True),
+
+  # vmap spec
+  (UPat(GroupOp.VMap, name="vm"), lambda vm:
+    all(((a.op == Ops.CONST and a.arg == 0) or a.op == Ops.RANGE) and (a.dtype == dtypes.index) for a in vm.arg) and \
+    vm.src[0].ndim == (len(vm.arg) if vm.op==Ops.VMAPIN else vm.arg.count(UOp.const(dtypes.index, 0)))),
 ])+movement_ops+shared_spec
 
 tensor_spec = PatternMatcher([
