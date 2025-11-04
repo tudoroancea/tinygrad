@@ -78,6 +78,9 @@ class Ops(FastEnum):
   # CUSTOM/CUSTOMI are used to output strings into codegen. the I makes the string inline
   CUSTOM = auto(); CUSTOMI = auto() # noqa: E702
 
+  # vmapping
+  VMAPIN = auto(); VMAPOUT=auto() # noqa: E702
+
 class GroupOp:
   Unary = {Ops.EXP2, Ops.LOG2, Ops.SIN, Ops.SQRT, Ops.RECIPROCAL, Ops.NEG, Ops.TRUNC}
   Binary = {Ops.ADD, Ops.MUL, Ops.IDIV, Ops.MAX, Ops.MOD, Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ,
@@ -92,6 +95,7 @@ class GroupOp:
 
   Irreducible = {Ops.CONST, Ops.DEFINE_VAR, Ops.SPECIAL, Ops.RANGE}
   Movement = {Ops.RESHAPE, Ops.EXPAND, Ops.PERMUTE, Ops.PAD, Ops.SHRINK, Ops.FLIP}
+  VMap = {Ops.VMAPIN, Ops.VMAPOUT}
 
   Buffer = {Ops.LOAD, Ops.STORE, Ops.CONST, Ops.DEFINE_VAR}
 

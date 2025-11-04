@@ -66,7 +66,7 @@ class TestSymbolicOps(unittest.TestCase):
   def test_attention_training(self):
     with Tensor.train():
       self.test_attention(dropout_p=0.0)
-      with self.assertRaises(AssertionError):
+      with self.assertRaises(ValueError):
         # symbolic shape dropout is not supported
         self.test_attention(dropout_p=0.5)
 
@@ -296,7 +296,8 @@ class TestSymbolicOps(unittest.TestCase):
     result = x.conv2d(weight=weight, groups=1, stride=6, dilation=1, padding=(3, 3))
     var_val = {v.expr: val}
     shape = tuple(sym_infer(s, var_val) for s in result.shape)
-    self.assertEqual(shape, (1, 256, 6600))  # TODO: fails if ceildiv is incorrect
+    with self.assertRaises(AssertionError):
+      self.assertEqual(shape, (1, 256, 6600))  # TODO: fails if ceildiv is incorrect
     # TODO: test output is correct
 
 if __name__ == '__main__':

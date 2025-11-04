@@ -326,7 +326,7 @@ class Tensor(MathMixin, MovementMixin):
     ```
     """
     if 0 in self.shape: return memoryview(bytearray(0)).cast(self.dtype.base.fmt)
-    # assert all_int(self.shape), f"no data if shape is symbolic, {self.shape=}"
+    assert all_int(self.shape), f"no data if shape is symbolic, {self.shape=}"
     return self._buffer().as_typed_buffer(self.shape)
 
   def item(self) -> ConstType:
@@ -1035,6 +1035,10 @@ class Tensor(MathMixin, MovementMixin):
       assert g.shape == t.shape, f"grad shape must match tensor shape, {g.shape!r} != {t.shape!r}"
       t.grad = g if t.grad is None else (t.grad + g)
     return self
+
+  # ***** vmapping ops *****
+  def vmapin(self, arg: tuple[UOp,...])->Tensor: return self._apply_uop(UOp.vmapin, arg=arg)
+  def vmapout(self, arg:tuple[UOp, ...])->Tensor: return self._apply_uop(UOp.vmapout, arg=arg)
 
   # ***** movement low level ops *****
 
@@ -3586,7 +3590,7 @@ class Tensor(MathMixin, MovementMixin):
     # first unsqueeze left with 1s https://data-apis.org/array-api/latest/API_specification/broadcasting.html
     shape, _ = _align_left(self.shape, new_shape)
     # for each dimension, check either dim is 1, or it does not change
-    if any(resolve(s != ns) and resolve(s != 1) for s,ns in zip(shape, new_shape)):
+    if not all(resolve(s == ns) or resolve(s == 1) for s,ns in zip(shape, new_shape)):
       raise ValueError(f"cannot broadcast {self.shape} to {new_shape=}")
     # NOTE: this cast is no-op in forward and uses sum_acc_dtype in the backward sum
     return self.reshape(shape).cast(sum_acc_dtype(self.dtype))._apply_uop(UOp.expand, arg=new_shape).cast(self.dtype)

@@ -1,4 +1,4 @@
-import time, struct, unittest
+import time, struct
 from typing import Any, Callable
 import numpy as np
 from tinygrad import Tensor, dtypes, Device
@@ -62,6 +62,3 @@ def not_support_multi_device():
 
 # NOTE: This will open REMOTE if it's the default device
 REAL_DEV = (Device.DEFAULT if Device.DEFAULT != "REMOTE" else Device['REMOTE'].properties.real_device)
-
-def assert_tuple_equal(self:unittest.TestCase, x:tuple, y:tuple):
-  for a,b in zip(x,y): self.assertFalse(a != b)

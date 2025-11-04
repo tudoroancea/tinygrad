@@ -24,8 +24,8 @@ def realize_assign(ctx:dict[UOp, None], a:UOp) -> None:
 pm_generate_realize_map = PatternMatcher([
   # always realize SINK src
   (UPat(Ops.SINK, name="s"), lambda ctx,s: ctx.update((x.base, None) for x in s.src if x.base.op not in ALWAYS_CONTIGUOUS)),
-  # always realize COPY/BUFFER_VIEW/CONTIGUOUS
-  (UPat({Ops.COPY, Ops.BUFFER_VIEW, Ops.CONTIGUOUS}, name="tr"), realize),
+  # always realize COPY/BUFFER_VIEW/CONTIGUOUS/VMAPOUT
+  (UPat({Ops.COPY, Ops.BUFFER_VIEW, Ops.CONTIGUOUS, Ops.VMAPOUT}, name="tr"), realize),
   # realize srcs of COPY, MSELECT, MSTACK
   (UPat((Ops.COPY, Ops.MSELECT, Ops.MSTACK), name="rb"), realize_srcs),
   # realize ASSIGN and input to assign (might be optimized out)
@@ -46,6 +46,7 @@ class IndexingContext:
   # create ranges
   range_idx: Iterator[int] = field(default_factory=itertools.count)
   def new_range(self, s:sint, axistype:AxisType=AxisType.LOOP) -> UOp:
+    # if isinstance(s, UOp) and len(s.ranges): return s
     if isinstance(s, UOp) and s.op is Ops.RANGE: return s
     # if a range has a 1 src, it's the same as UOp.const(dtypes.index, 0)
     return UOp.range(s, next(self.range_idx), axistype) if resolve(s!=1) else UOp.const(dtypes.index, 0)
@@ -65,6 +66,7 @@ def create_bufferize_and_index_based_on_ranges(ctx:IndexingContext, x:UOp):
       # None in the device assigns it a number later
       opts = BufferizeOpts(device=s.device) if len(ctx.range_map[s][1]) == len(realized_ranges) else BufferizeOpts(None, AddrSpace.LOCAL)
       new_src = UOp(Ops.BUFFERIZE, s.dtype, src=(new_src,)+closed_ranges, arg=opts, tag=s.tag if opts.addrspace == AddrSpace.GLOBAL else None)
+      # print(x.op, s.op, realized_ranges, closed_ranges)
       if x in ctx.range_map: new_src = new_src.index(*[r for i,r in enumerate(ctx.range_map[x][0]) if i in realized_ranges])
     new_srcs.append(new_src)
   # NOTE: do we need this?
@@ -105,6 +107,8 @@ pm_apply_rangeify = PatternMatcher([
   (UPat(GroupOp.All, name="x"), create_bufferize_and_index_based_on_ranges),
   # remove movement op
   (UPat(GroupOp.Movement, name="x"), remove_movement_op_after_rangeify),
+  # remove vmap op
+  (UPat(GroupOp.VMap, name="x"), lambda ctx,x: x.src[0]),
   # const/define_var shouldn't have src
   (UPat((Ops.CONST, Ops.DEFINE_VAR), name="c"), lambda ctx,c: c.replace(src=()) if c in ctx.range_map else None),
 ])
@@ -113,15 +117,15 @@ pm_apply_rangeify = PatternMatcher([
 @functools.cache
 def apply_movement_op(op:Ops, in_shape:tuple[sint,...], arg:tuple, rngs:tuple[UOp, ...]) -> tuple[UOp, ...]:
   match op:
-    case Ops.SHRINK:  rngs = tuple(a if resolve(ss == 0) else a+ss for a,(ss,_) in zip(rngs, arg))
+    case Ops.SHRINK:  rngs = tuple(a if ss == 0 else a+ss for a,(ss,_) in zip(rngs, arg))
     case Ops.PERMUTE: rngs = tuple(rngs[p] for p in argsort(arg))
     case Ops.FLIP:    rngs = tuple(((s-1)-a) if f else a for a,s,f in zip(rngs, in_shape, arg))
-    case Ops.EXPAND:  rngs = tuple(a if resolve(in_sh == out_sh) else a.const_like(0) for a,in_sh,out_sh in zip(rngs, in_shape, arg))
+    case Ops.EXPAND:  rngs = tuple(a if in_sh == out_sh else a.const_like(0) for a,in_sh,out_sh in zip(rngs, in_shape, arg))
     case Ops.PAD:
       # TODO: why is multiple graph_rewrites faster than one here?
       # TODO: the .where(r-s, i) is not inside the graph_rewrite so that `convert_pad_to_where_to_keep_behavior_local`
       #       wraps the pad with only the newly added valid
-      rngs = tuple(r if resolve(s == 0) and resolve(e == 0) else graph_rewrite(((r >= s) & (r < (sh+s))),
+      rngs = tuple(r if (s == 0 and e == 0) else graph_rewrite(((r >= s) & (r < (sh+s))),
         symbolic+pm_simplify_valid, name="pad").where(r-s, UOp.invalid()) for r,sh,(s,e) in zip(rngs, in_shape, arg))
     case Ops.RESHAPE:
       acc = 1
@@ -170,7 +174,7 @@ def run_rangeify(tsink:UOp, debug:bool=False) -> tuple[UOp, IndexingContext]:
     consumer_rngs = [rctx.range_map[c][0] for c in consumer_map[x] if c in rctx.range_map]
     if x in rctx.realize_map:
       # if this is in the realize_map, we create new ranges (at the output)
-      out_rngs = tuple(rctx.new_range(s) for s in x.shape)
+      out_rngs = tuple(a if a.op == Ops.RANGE else rctx.new_range(d) for a,d in zip(x.arg, x.shape)) if x.op == Ops.VMAPOUT else tuple(rctx.new_range(s) for s in x.shape)
       # all ranges are ended now
       ending_ranges[x] = []
       # mark all ranges as ended
@@ -185,7 +189,7 @@ def run_rangeify(tsink:UOp, debug:bool=False) -> tuple[UOp, IndexingContext]:
     elif len(consumer_rngs) == 1:
       # if this has one consumer, it inherits the ranges from it
       out_rngs = consumer_rngs[0]
-    elif len(consumer_rngs) > 1:
+    else: # len(consumer_rngs) > 1
       # if this has two consumers, we have to merge the ranges and might create new ones
       all_rngs: list[tuple[UOp, ...]] = list(zip(*consumer_rngs))
       rngs_valids = []
@@ -240,6 +244,22 @@ def run_rangeify(tsink:UOp, debug:bool=False) -> tuple[UOp, IndexingContext]:
     # NOTE: this doesn't actually always end a range, but this is why convs are realized, so for now we need it
     if x.op is Ops.EXPAND and all(isinstance(y, int) or y.op is not Ops.RANGE for y in x.shape):
       ending_ranges[x] = list(UOp.sink(*[ro for ri, ro in zip(rngs, out_rngs) if ri is not ro]).ranges.keys())
+
+    # vmapin/out
+    if x.op == Ops.VMAPIN:
+      # TODO: what happens if there are multiple consumers ?
+      # insert back outerworld ranges
+      rngs = list(out_rngs)
+      for i,a in enumerate(x.arg):
+        if a.op == Ops.RANGE:
+          rngs.insert(i, a)
+      rngs = tuple(rngs)
+      print("VMAPIN ranges:", tuple(r.render() for r in rngs), tuple(r.render() for r in out_rngs))
+    elif x.op == Ops.VMAPOUT:
+      # remove outerworld ranges
+      assert len(x.src[0].shape) == x.arg.count(UOp.const(dtypes.index, 0))
+      rngs = tuple(r for a,r in zip(x.arg, out_rngs) if a.op == Ops.CONST)
+      print("VMAPOUT ranges:", tuple(r.render() for r in rngs), tuple(r.render() for r in out_rngs))
 
     # REDUCE_AXIS creates ranges for the axes it is reducing
     if x.op is Ops.REDUCE_AXIS:
