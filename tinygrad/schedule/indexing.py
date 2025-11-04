@@ -174,7 +174,8 @@ def run_rangeify(tsink:UOp, debug:bool=False) -> tuple[UOp, IndexingContext]:
     consumer_rngs = [rctx.range_map[c][0] for c in consumer_map[x] if c in rctx.range_map]
     if x in rctx.realize_map:
       # if this is in the realize_map, we create new ranges (at the output)
-      out_rngs = tuple(a if a.op == Ops.RANGE else rctx.new_range(d) for a,d in zip(x.arg, x.shape)) if x.op == Ops.VMAPOUT else tuple(rctx.new_range(s) for s in x.shape)
+      out_rngs = tuple(a if a.op == Ops.RANGE else rctx.new_range(d) for a,d in zip(x.arg, x.shape)) \
+                  if x.op == Ops.VMAPOUT else tuple(rctx.new_range(s) for s in x.shape)
       # all ranges are ended now
       ending_ranges[x] = []
       # mark all ranges as ended
