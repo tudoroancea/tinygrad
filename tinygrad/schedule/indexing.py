@@ -46,7 +46,6 @@ class IndexingContext:
   # create ranges
   range_idx: Iterator[int] = field(default_factory=itertools.count)
   def new_range(self, s:sint, axistype:AxisType=AxisType.LOOP) -> UOp:
-    # if isinstance(s, UOp) and len(s.ranges): return s
     if isinstance(s, UOp) and s.op is Ops.RANGE: return s
     # if a range has a 1 src, it's the same as UOp.const(dtypes.index, 0)
     return UOp.range(s, next(self.range_idx), axistype) if resolve(s!=1) else UOp.const(dtypes.index, 0)
@@ -55,7 +54,8 @@ def create_bufferize_and_index_based_on_ranges(ctx:IndexingContext, x:UOp):
   if x.op in {Ops.BUFFERIZE, Ops.INDEX}: return None
   if x.op is Ops.AFTER and x.src[1].op is Ops.KERNEL: return None
   new_srcs = []
-  for s in x.src:
+  for i,s in enumerate(x.src):
+    if x.op in GroupOp.VMap and i >= 1: continue
     new_src = s
     if s.op in {Ops.BUFFER, Ops.BUFFER_VIEW, Ops.MSTACK, Ops.MSELECT} or (s.op is Ops.AFTER and s.src[1].op is Ops.KERNEL):
       if x in ctx.range_map: new_src = new_src.index(*ctx.range_map[x][0])
@@ -66,7 +66,6 @@ def create_bufferize_and_index_based_on_ranges(ctx:IndexingContext, x:UOp):
       # None in the device assigns it a number later
       opts = BufferizeOpts(device=s.device) if len(ctx.range_map[s][1]) == len(realized_ranges) else BufferizeOpts(None, AddrSpace.LOCAL)
       new_src = UOp(Ops.BUFFERIZE, s.dtype, src=(new_src,)+closed_ranges, arg=opts, tag=s.tag if opts.addrspace == AddrSpace.GLOBAL else None)
-      # print(x.op, s.op, realized_ranges, closed_ranges)
       if x in ctx.range_map: new_src = new_src.index(*[r for i,r in enumerate(ctx.range_map[x][0]) if i in realized_ranges])
     new_srcs.append(new_src)
   if x.op in GroupOp.VMap:
@@ -176,7 +175,7 @@ def run_rangeify(tsink:UOp, debug:bool=False) -> tuple[UOp, IndexingContext]:
     consumer_rngs = [rctx.range_map[c][0] for c in consumer_map[x] if c in rctx.range_map]
     if x in rctx.realize_map:
       # if this is in the realize_map, we create new ranges (at the output)
-      out_rngs = tuple(a if a.op == Ops.RANGE else rctx.new_range(d) for a,d in zip(x.arg, x.shape)) \
+      out_rngs = tuple(a if a.op == Ops.RANGE else rctx.new_range(d) for a,d in zip(x.src[1:], x.shape)) \
                   if x.op == Ops.VMAPOUT else tuple(rctx.new_range(s) for s in x.shape)
       # all ranges are ended now
       ending_ranges[x] = []
@@ -253,14 +252,14 @@ def run_rangeify(tsink:UOp, debug:bool=False) -> tuple[UOp, IndexingContext]:
       # TODO: what happens if there are multiple consumers ?
       # insert back outerworld ranges
       rngs = list(out_rngs)
-      for i,a in enumerate(x.arg):
+      for i,a in enumerate(x.src[1:]):
         if a.op == Ops.RANGE:
           rngs.insert(i, a)
       rngs = tuple(rngs)
     elif x.op == Ops.VMAPOUT:
       # remove outerworld ranges
-      assert len(x.src[0].shape) == x.arg.count(UOp.const(dtypes.index, 0))
-      rngs = tuple(r for a,r in zip(x.arg, out_rngs) if a.op == Ops.CONST)
+      assert len(x.src[0].shape) == x.src[1:].count(UOp.const(dtypes.index, 0))
+      rngs = tuple(r for a,r in zip(x.src[1:], out_rngs) if a.op == Ops.CONST)
 
     # REDUCE_AXIS creates ranges for the axes it is reducing
     if x.op is Ops.REDUCE_AXIS:

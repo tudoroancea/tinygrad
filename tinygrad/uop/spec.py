@@ -112,8 +112,8 @@ _tensor_spec = PatternMatcher([
 
   # vmap spec
   (UPat(GroupOp.VMap, name="vm"), lambda vm:
-    all(((a.op == Ops.CONST and a.arg == 0) or a.op == Ops.RANGE) and (a.dtype == dtypes.index) for a in vm.arg) and \
-    vm.src[0].ndim == (len(vm.arg) if vm.op==Ops.VMAPIN else vm.arg.count(UOp.const(dtypes.index, 0)))),
+    all(((a.op == Ops.CONST and a.arg == 0) or a.op == Ops.RANGE) and (a.dtype == dtypes.index) for a in vm.src[1:]) and \
+    vm.src[0].ndim == (len(vm.src[1:]) if vm.op==Ops.VMAPIN else vm.src[1:].count(UOp.const(dtypes.index, 0)))),
 ])+movement_ops+shared_spec
 
 tensor_spec = PatternMatcher([

@@ -1037,8 +1037,8 @@ class Tensor(MathMixin, MovementMixin):
     return self
 
   # ***** vmapping ops *****
-  def vmapin(self, arg: tuple[UOp,...])->Tensor: return self._apply_uop(UOp.vmapin, arg=arg)
-  def vmapout(self, arg:tuple[UOp, ...])->Tensor: return self._apply_uop(UOp.vmapout, arg=arg)
+  def vmapin(self, varg:tuple[UOp,...])->Tensor: return self._apply_uop(UOp.vmapin, varg=varg)
+  def vmapout(self, varg:tuple[UOp, ...])->Tensor: return self._apply_uop(UOp.vmapout, varg=varg)
 
   # ***** movement low level ops *****
 

@@ -10,15 +10,15 @@ class TestVmap(unittest.TestCase):
     x = UOp.new_buffer("CPU", 18, dtypes.float, 0).reshape((3,6))
     rm1 = UOp.range(3,-1)
     rm2 = UOp.range(6,-2)
-    for arg, shape in [ ((rm1, rm1.const_like(0)), (6,)), ((rm2.const_like(0), rm2), (3,)), ((rm1, rm2), ()) ]:
-      assert x.vmapin(arg).shape == shape
+    for varg, shape in [ ((rm1, rm1.const_like(0)), (6,)), ((rm2.const_like(0), rm2), (3,)), ((rm1, rm2), ()) ]:
+      assert x.vmapin(varg).shape == shape
 
   def test_vmapout_shape(self):
     x = UOp.new_buffer("CPU", 18, dtypes.float, 0).reshape((3,6))
     rm1 = UOp.range(3,-1)
     rm2 = UOp.range(6,-2)
-    for arg in [ (rm1, rm1.const_like(0)),(rm2.const_like(0), rm2), (rm1, rm2) ]:
-      assert x.vmapin(arg).vmapout(arg).shape == x.shape
+    for varg in [ (rm1, rm1.const_like(0)),(rm2.const_like(0), rm2), (rm1, rm2) ]:
+      assert x.vmapin(varg).vmapout(varg).shape == x.shape
 
   def test_vmap(self):
     x = UOp.new_buffer("CPU", 18, dtypes.float, 0).reshape((3,6))

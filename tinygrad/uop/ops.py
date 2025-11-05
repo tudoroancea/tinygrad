@@ -200,11 +200,11 @@ class UOp(MathMixin, MovementMixin, metaclass=UOpMetaClass):
         return self.src[0].shape[len(self.src[1:]):]
 
       case Ops.VMAPIN:
-        assert self.src[0].ndim == len(self.arg)
-        return tuple(d for d,a in zip(self.src[0]._shape, self.arg) if a == UOp.const(dtypes.index, 0))
+        assert self.src[0].ndim == len(self.src[1:])
+        return tuple(d for d,a in zip(self.src[0]._shape, self.src[1:]) if a == UOp.const(dtypes.index, 0))
       case Ops.VMAPOUT:
         out_shape = list(self.src[0]._shape)
-        for i,a in enumerate(self.arg):
+        for i,a in enumerate(self.src[1:]):
           if a.op == Ops.RANGE:
             out_shape.insert(i, a.src[0].arg)
         return tuple(out_shape)
@@ -562,8 +562,8 @@ class UOp(MathMixin, MovementMixin, metaclass=UOpMetaClass):
   def shrink(self, arg:tuple[tuple[sint, sint], ...]): return self._mop(Ops.SHRINK, arg, same_shape_noop=True)
   def pad(self, arg:tuple[tuple[sint, sint], ...]): return self._mop(Ops.PAD, arg, same_shape_noop=True)
 
-  def vmapin(self, arg:tuple[UOp, ...]): return UOp(Ops.VMAPIN, self.dtype, (self,), arg)
-  def vmapout(self, arg:tuple[UOp, ...]): return UOp(Ops.VMAPOUT, self.dtype, (self,), arg)
+  def vmapin(self, varg:tuple[UOp, ...]): return UOp(Ops.VMAPIN, self.dtype, (self,) + varg)
+  def vmapout(self, varg:tuple[UOp, ...]): return UOp(Ops.VMAPOUT, self.dtype, (self,) + varg)
 
   # in these two, we have custom logic to check if they are a no-op
   def permute(self, arg:tuple[int, ...]): return self._mop(Ops.PERMUTE, arg, same_shape_noop=False) if arg != tuple(range(len(self.shape))) else self
