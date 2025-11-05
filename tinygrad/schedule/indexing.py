@@ -69,6 +69,10 @@ def create_bufferize_and_index_based_on_ranges(ctx:IndexingContext, x:UOp):
       # print(x.op, s.op, realized_ranges, closed_ranges)
       if x in ctx.range_map: new_src = new_src.index(*[r for i,r in enumerate(ctx.range_map[x][0]) if i in realized_ranges])
     new_srcs.append(new_src)
+  if x.op in GroupOp.VMap:
+    # VMAPIN/OUT cannot follow an INDEX because INDEX doesn't have a shape, which breaks their spec
+    assert len(new_srcs) == 1
+    return new_srcs[0]
   # NOTE: do we need this?
   return x.replace(src=tns) if x.src != (tns:=tuple(new_srcs)) else None
 
@@ -107,8 +111,6 @@ pm_apply_rangeify = PatternMatcher([
   (UPat(GroupOp.All, name="x"), create_bufferize_and_index_based_on_ranges),
   # remove movement op
   (UPat(GroupOp.Movement, name="x"), remove_movement_op_after_rangeify),
-  # remove vmap op
-  (UPat(GroupOp.VMap, name="x"), lambda ctx,x: x.src[0]),
   # const/define_var shouldn't have src
   (UPat((Ops.CONST, Ops.DEFINE_VAR), name="c"), lambda ctx,c: c.replace(src=()) if c in ctx.range_map else None),
 ])
