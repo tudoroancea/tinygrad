@@ -249,13 +249,9 @@ def run_rangeify(tsink:UOp, debug:bool=False) -> tuple[UOp, IndexingContext]:
 
     # vmapin/out
     if x.op == Ops.VMAPIN:
-      # TODO: what happens if there are multiple consumers ?
       # insert back outerworld ranges
-      rngs = list(out_rngs)
-      for i,a in enumerate(x.src[1:]):
-        if a.op == Ops.RANGE:
-          rngs.insert(i, a)
-      rngs = tuple(rngs)
+      out_rngs_iter = iter(out_rngs)
+      rngs = tuple(a if a.op == Ops.RANGE else next(out_rngs_iter) for a in x.src[1:])
     elif x.op == Ops.VMAPOUT:
       # remove outerworld ranges
       assert len(x.src[0].shape) == x.src[1:].count(UOp.const(dtypes.index, 0))
