@@ -2,13 +2,13 @@ from typing import Callable
 
 import numpy as np
 
-from tinygrad import Tensor, UOp, dtypes, nn
+from tinygrad import Tensor, UOp
 from tinygrad.dtype import AddrSpace
 from tinygrad.uop import Ops
 from tinygrad.uop.ops import AxisType, KernelInfo
 
 Tensor.manual_seed(127)
-
+np.random.seed(127)
 
 def tril1_kernel(L: UOp, A: UOp):
   assert L.ndim == A.ndim == 2 and L.shape[-2] == L.shape[-1] == A.shape[-2] == A.shape[-1]
@@ -60,7 +60,8 @@ def chol1_kernel(L: UOp, A: UOp) -> UOp:
   assert L.dtype == A.dtype
   dtype = L.dtype.base
   n = int(L.shape[0])
-  i, j = UOp.range(n, 0), UOp.range(n, 1)
+  i = UOp.range(n, 0, AxisType.LOOP)
+  j= UOp.range(n, 1, AxisType.LOOP)
   zero = UOp.const(dtype, 0.0)
 
   # create accumulation var
@@ -108,8 +109,8 @@ def test_kernel(prefix: str, A: Tensor, kernel: Callable[[UOp, UOp], UOp], numpy
 
 def main():
   n = 4
-  A = Tensor.randn(n, n)
-  A = Tensor.realize(Tensor.eye(n) + A.T @ A)
+  An = np.random.randn(n,n).astype(np.float32)
+  A = Tensor(np.eye(n, dtype=np.float32) + An.T @ An, device="CPU").realize()
   print("")
 
   if n <= 4:
@@ -121,7 +122,7 @@ def main():
   if n <= 4:
     print("np.chol(A)=\n", np.linalg.cholesky(A.numpy()))
   test_kernel("chol1", A, chol1_kernel, np.linalg.cholesky)
-  test_kernel("chol2", A, chol2_kernel, None)
+  test_kernel("chol2", A, chol2_kernel, np.linalg.cholesky)
 
 
 if __name__ == "__main__":
