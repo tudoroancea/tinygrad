@@ -1,8 +1,9 @@
 import math
-from typing import cast, Any
-from tinygrad.uop.ops import PatternMatcher, UPat, GroupOp, Ops, UOp, print_uops, AxisType, KernelInfo, pyrender, Kernel
-from tinygrad.dtype import DType, ImageDType, dtypes, PtrDType, AddrSpace, Invalid
-from tinygrad.helpers import DEBUG, Context, prod, SPEC, Metadata
+from typing import Any, cast
+
+from tinygrad.dtype import AddrSpace, DType, ImageDType, Invalid, PtrDType, dtypes
+from tinygrad.helpers import DEBUG, SPEC, Context, Metadata, prod
+from tinygrad.uop.ops import AxisType, GroupOp, Kernel, KernelInfo, Ops, PatternMatcher, UOp, UPat, print_uops, pyrender
 from tinygrad.uop.validate import validate_index
 
 # four specs:
@@ -40,6 +41,9 @@ shared_spec = PatternMatcher([
     rng.dtype == x.dtype and isinstance(rng.arg, tuple) and len(rng.arg) >= 2 and \
       all(isinstance(ra, int) for ra in rng.arg[0:-1]) and isinstance(rng.arg[-1], AxisType)),
   (UPat(Ops.INDEX, src=(UPat(),), allow_any_len=True, name="x"), lambda x: all(y.dtype == dtypes.index for y in x.src[1:]) or None),
+
+  # RANGE/SPECIAL define loops, END closes them
+  (UPat(Ops.END, src=(UPat(), UPat(Ops.RANGE))), lambda: True),
 ])
 
 # ***** UOp spec in the Tensor graph *****
@@ -110,6 +114,10 @@ _tensor_spec = PatternMatcher([
   # AFTER if things were kernelized
   (UPat(Ops.AFTER, src=(UPat((Ops.BUFFER, Ops.AFTER)),), allow_any_len=True), lambda: True),
 
+  # Tensor range bind / store
+  (UPat(Ops.BIND, (dtypes.int,dtypes.index,), (UPat(Ops.DEFINE_VAR), UPat(Ops.RANGE)), arg=None), lambda: True),
+  (UPat(Ops.STORE, src=(UPat(), UPat())), lambda: True),
+
   # vmap spec
   (UPat(GroupOp.VMap, name="vm"), lambda vm:
     all(((a.op == Ops.CONST and a.arg == 0) or a.op == Ops.RANGE) and (a.dtype == dtypes.index) for a in vm.src[1:]) and \
@@ -132,9 +140,6 @@ shared_codegen_spec = PatternMatcher([
   # allow AFTER on buffers, GROUP anywhere
   (UPat(Ops.AFTER, src=(UPat(GroupOp.Defines|{Ops.AFTER}),), allow_any_len=True), lambda: True),
   (UPat(Ops.GROUP, dtypes.void), lambda: True),
-
-  # RANGE/SPECIAL define loops, END closes them
-  (UPat(Ops.END, src=(UPat(), UPat(Ops.RANGE)), dtype=dtypes.void), lambda: True),
 
   # WMMA has a <a, b, acc>
   (UPat(Ops.WMMA, src=(UPat(), UPat(), UPat()), name="x"), lambda x: isinstance(x.arg, tuple) and len(x.arg) == 8),
@@ -172,7 +177,7 @@ kernel_spec = PatternMatcher([
   (UPat(Ops.UNROLL, name="x"), lambda x: x.src[0].dtype.count == prod(y[1] for y in x.arg)),
 
   # END can end multiple axes here
-  (UPat(Ops.END, src=(UPat(), UPat()), allow_any_len=True, dtype=dtypes.void), lambda: True),
+  (UPat(Ops.END, src=(UPat(), UPat()), allow_any_len=True), lambda: True),
 
   # bufferize can be on anything
   (UPat(Ops.BUFFERIZE, src=(UPat(),), allow_any_len=True, name="x"), lambda x: True),
@@ -273,6 +278,7 @@ def type_verify(ast:UOp|list[UOp], check_spec:PatternMatcher):
 # late imports to avoid circular import
 from tinygrad.codegen.opt import Opt, OptOps
 from tinygrad.schedule.rangeify import BufferizeOpts
+
 glbls:dict[str, Any] = {"inf": math.inf, "nan": math.nan, "KernelInfo": KernelInfo, "Kernel": Kernel, "Metadata": Metadata,
                         "UOp": UOp, "dtypes": dtypes, "Ops": Ops, "AxisType": AxisType, "Invalid": Invalid,
                         "Opt": Opt, "OptOps": OptOps, "BufferizeOpts": BufferizeOpts, "AddrSpace": AddrSpace}

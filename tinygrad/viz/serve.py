@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 import multiprocessing, pickle, difflib, os, threading, json, time, sys, webbrowser, socket, argparse, socketserver, functools, codecs, io, struct
-import subprocess, ctypes, pathlib, traceback
+import ctypes, pathlib, traceback
 from contextlib import redirect_stdout, redirect_stderr
 from decimal import Decimal
 from http.server import BaseHTTPRequestHandler
 from urllib.parse import parse_qs, urlparse
 from typing import Any, TypedDict, TypeVar, Generator, Callable
 from tinygrad.helpers import colored, getenv, tqdm, unwrap, word_wrap, TRACEMETA, ProfileEvent, ProfileRangeEvent, TracingKey, ProfilePointEvent, temp
-from tinygrad.uop.ops import TrackedGraphRewrite, RewriteTrace, UOp, Ops, printable, GroupOp, srender, sint, sym_infer, range_str, pyrender
+from tinygrad.helpers import printable, system
+from tinygrad.uop.ops import TrackedGraphRewrite, RewriteTrace, UOp, Ops, GroupOp, srender, sint, sym_infer, range_str, pyrender
 from tinygrad.uop.ops import print_uops, range_start, multirange_str
 from tinygrad.device import ProfileDeviceEvent, ProfileGraphEvent, ProfileGraphEntry, Device
 from tinygrad.renderer import ProgramSpec
@@ -25,18 +26,25 @@ uops_colors = {Ops.LOAD: "#ffc0c0", Ops.STORE: "#87CEEB", Ops.CONST: "#e0e0e0", 
 
 # VIZ API
 
+
+# A step is a lightweight descriptor for a trace entry
+# Includes a name, metadata and a URL path for fetching the full data
+
+def create_step(name:str, query:tuple[str, int, int], data=None, depth:int=0, **kwargs) -> dict:
+  return {"name":name, "query":f"{query[0]}?ctx={query[1]}&step={query[2]}", "data":data, "depth":depth, **kwargs}
+
 # ** list all saved rewrites
 
 ref_map:dict[Any, int] = {}
 def get_rewrites(t:RewriteTrace) -> list[dict]:
   ret = []
   for i,(k,v) in enumerate(zip(t.keys, t.rewrites)):
-    steps = [{"name":s.name, "loc":s.loc, "match_count":len(s.matches), "code_line":printable(s.loc),
-              "query":f"/ctxs?ctx={i}&idx={j}", "depth":s.depth} for j,s in enumerate(v)]
+    steps = [create_step(s.name, ("/rewrites", i, j), loc=s.loc, match_count=len(s.matches), code_line=printable(s.loc), trace=k.tb if j==0 else None,
+                         depth=s.depth) for j,s in enumerate(v)]
     if isinstance(k.ret, ProgramSpec):
-      steps.append({"name":"View UOp List", "query":f"/render?ctx={i}&fmt=uops", "depth":0})
-      steps.append({"name":"View Program", "query":f"/render?ctx={i}&fmt=src", "depth":0})
-      steps.append({"name":"View Disassembly", "query":f"/render?ctx={i}&fmt=asm", "depth":0})
+      steps.append(create_step("View UOp List", ("/uops", i, len(steps)), k.ret))
+      steps.append(create_step("View Program", ("/code", i, len(steps)), k.ret))
+      steps.append(create_step("View Disassembly", ("/asm", i, len(steps)), k.ret))
     for key in k.keys: ref_map[key] = i
     ret.append({"name":k.display_name, "steps":steps})
   return ret
@@ -64,6 +72,7 @@ def uop_to_json(x:UOp) -> dict[int, dict]:
     # always exclude DEVICE/CONST/UNIQUE
     if u.op in {Ops.DEVICE, Ops.CONST, Ops.UNIQUE} and u is not x: excluded.add(u)
     if u.op is Ops.VCONST and u.dtype.scalar() == dtypes.index and u is not x: excluded.add(u)
+    if u.op is Ops.VECTORIZE and len(u.src) == 0: excluded.add(u)
   for u in toposort:
     if u in excluded: continue
     argst = codecs.decode(str(u.arg), "unicode_escape")
@@ -81,7 +90,7 @@ def uop_to_json(x:UOp) -> dict[int, dict]:
     try:
       if len(rngs:=u.ranges):
         label += f"\n({multirange_str(rngs, color=True)})"
-      if u.op not in {Ops.BUFFER, Ops.KERNEL, Ops.ASSIGN, Ops.COPY, Ops.SINK, *GroupOp.Buffer} and u._shape is not None:
+      if u._shape is not None:
         label += f"\n{shape_to_str(u.shape)}"
       if u.op in {Ops.INDEX, Ops.BUFFERIZE}:
         label += f"\n{u.render()}"
@@ -152,17 +161,22 @@ def timeline_layout(dev_events:list[tuple[int, int, float, DevEvent]], start_ts:
   for st,et,dur,e in dev_events:
     if isinstance(e, ProfilePointEvent) and e.name == "exec": exec_points[e.arg["name"]] = e
     if dur == 0: continue
-    name, info, key = e.name, None, None
+    name, fmt, key = e.name, [], None
     if (ref:=ref_map.get(name)) is not None:
       name = ctxs[ref]["name"]
       if isinstance(p:=trace.keys[ref].ret, ProgramSpec) and (ei:=exec_points.get(p.name)) is not None:
-        info = f"{sym_infer(p.estimates.ops, ei.arg['var_vals'])/(t:=dur*1e3):.2f} GFLOPS {sym_infer(p.estimates.mem, ei.arg['var_vals'])/t:4.1f}"+ \
-               f"|{sym_infer(p.estimates.lds,ei.arg['var_vals'])/t:.1f} GB/s\n{[str(m) for m in (ei.arg['metadata'] or ())]}"
+        flops = sym_infer(p.estimates.ops, var_vals:=ei.arg['var_vals'])/(t:=dur*1e-6)
+        membw, ldsbw = sym_infer(p.estimates.mem, var_vals)/t, sym_infer(p.estimates.lds, var_vals)/t
+        fmt = [f"{flops*1e-9:.0f} GFLOPS" if flops < 1e14 else f"{flops*1e-12:.0f} TFLOPS",
+              (f"{membw*1e-9:.0f} GB/s" if membw < 1e13 else f"{membw*1e-12:.0f} TB/s")+" mem",
+              (f"{ldsbw*1e-9:.0f} GB/s" if ldsbw < 1e15 else f"{ldsbw*1e-12:.0f} TB/s")+" lds"]
+        if (metadata_str:=",".join([str(m) for m in (ei.arg['metadata'] or ())])): fmt.append(metadata_str)
+        if isinstance(e, ProfileGraphEntry): fmt.append("(batched)")
         key = ei.key
     elif isinstance(e.name, TracingKey):
       name = e.name.display_name
       ref = next((v for k in e.name.keys if (v:=ref_map.get(k)) is not None), None)
-    events.append(struct.pack("<IIIIfI", enum_str(name, scache), option(ref), option(key), st-start_ts, dur, enum_str(info or "", scache)))
+    events.append(struct.pack("<IIIIfI", enum_str(name, scache), option(ref), option(key), st-start_ts, dur, enum_str("\n".join(fmt), scache)))
   return struct.pack("<BI", 0, len(events))+b"".join(events) if events else None
 
 def encode_mem_free(key:int, ts:int, execs:list[ProfilePointEvent], scache:dict) -> bytes:
@@ -206,18 +220,38 @@ def load_sqtt(profile:list[ProfileEvent]) -> None:
     return ctxs.append({"name":"Counters", "steps":[step]})
   try: from extra.sqtt.roc import decode
   except Exception: return err("DECODER IMPORT ISSUE")
-  try:
-    rctx = decode(profile)
-    summary = [[{"label":"Total Cycles", "value":x[-1].time-x[0].time if x else 0}] for i,x in enumerate(rctx.inst_execs.values())]
-    steps = [{"name":str(x[0]), "depth":0, "data":{"rows":[(e.inst, e.time, e.time-x[1][i-1].time if i else 0, e.dur, e.stall,
-                                                            str(e.typ).split("_")[-1]) for i,e in enumerate(x[1])],
-                                              "cols":["Instruction", "Clk", "Wait", "Duration", "Stall", "Type"], "summary":summary[i]},
-              "query":f"/render?ctx={len(ctxs)}&step={i}&fmt=counters"} for i,x in enumerate(rctx.inst_execs.items())]
-    if not steps: return err("EMPTY SQTT OUTPUT", f"{len(sqtt_events)} SQTT events recorded, none got decoded")
+  try: rctx = decode(profile)
   except Exception: return err("DECODER ERROR")
+  if not rctx.inst_execs: return err("EMPTY SQTT OUTPUT", f"{len(sqtt_events)} SQTT events recorded, none got decoded")
+  steps:list[dict] = []
+  units:set[str] = set()
+  for name,waves in rctx.inst_execs.items():
+    events:list[ProfileEvent] = []
+    prg = trace.keys[r].ret if (r:=ref_map.get(name)) else None
+    steps.append(first:=create_step(prg.name if prg is not None else name, ("/counters", len(ctxs), len(steps))))
+    # Idle:     The total time gap between the completion of previous instruction and the beginning of the current instruction.
+    #           The idle time can be caused by:
+    #             * Arbiter loss
+    #             * Source or destination register dependency
+    #             * Instruction cache miss
+    # Stall:    The total number of cycles the hardware pipe couldn't issue an instruction.
+    # Duration: Total latency in cycles, defined as "Stall time + Issue time" for gfx9 or "Stall time + Execute time" for gfx10+.
+    for w in waves:
+      units.add(row:=f"SE:{w.se} CU:{w.cu} SIMD:{w.simd} WAVE:{w.wave_id}")
+      events.append(ProfileRangeEvent(row, wave_name:="wave", Decimal(w.begin_time), Decimal(w.end_time)))
+      rows, prev_instr = [], w.begin_time
+      for i,e in enumerate(w.insts):
+        rows.append((e.inst, e.time, max(0, e.time-prev_instr), e.dur, e.stall, str(e.typ).split("_")[-1]))
+        prev_instr = max(prev_instr, e.time + e.dur)
+      summary = [{"label":"Total Cycles", "value":w.end_time-w.begin_time}, {"label":"SIMD", "value":w.simd}, {"label":"CU", "value":w.cu},
+                 {"label":"SE", "value":w.se}]
+      steps.append(create_step(wave_name, ("/counters", len(ctxs), len(steps)), depth=2,
+                               data={"rows":rows, "cols":["Instruction", "Clk", "Idle", "Duration", "Stall", "Type"], "summary":summary}))
+    events = [ProfilePointEvent(unit, "start", unit, ts=Decimal(0)) for unit in units]+events
+    first["data"] = {"value":get_profile(events, lambda k:tuple(int(x.split(":")[1]) for x in k.split())), "content_type":"application/octet-stream"}
   ctxs.append({"name":"Counters", "steps":steps})
 
-def get_profile(profile:list[ProfileEvent]) -> bytes|None:
+def get_profile(profile:list[ProfileEvent], sort_fn:Callable[[str], Any]|None=None) -> bytes|None:
   # start by getting the time diffs
   for ev in profile:
     if isinstance(ev,ProfileDeviceEvent): device_ts_diffs[ev.device] = (ev.comp_tdiff, ev.copy_tdiff if ev.copy_tdiff is not None else ev.comp_tdiff)
@@ -243,8 +277,8 @@ def get_profile(profile:list[ProfileEvent]) -> bytes|None:
   scache:dict[str, int] = {}
   peaks:list[int] = []
   dtype_size:dict[str, int] = {}
-  for k,v in dev_events.items():
-    v.sort(key=lambda e:e[0])
+  for k in sorted(dev_events, key=sort_fn) if sort_fn else dev_events:
+    (v:=dev_events[k]).sort(key=lambda e:e[0])
     layout[k] = timeline_layout(v, start_ts, scache)
     layout[f"{k} Memory"] = mem_layout(v, start_ts, unwrap(end_ts), peaks, dtype_size, scache)
   groups = sorted(layout.items(), key=lambda x: '' if len(ss:=x[0].split(" ")) == 1 else ss[1])
@@ -255,9 +289,9 @@ def get_profile(profile:list[ProfileEvent]) -> bytes|None:
 # ** Assembly analyzers
 
 def get_llvm_mca(asm:str, mtriple:str, mcpu:str) -> dict:
-  target_args = [f"-mtriple={mtriple}", f"-mcpu={mcpu}"]
+  target_args = f"-mtriple={mtriple} -mcpu={mcpu}"
   # disassembly output can include headers / metadata, skip if llvm-mca can't parse those lines
-  data = json.loads(subprocess.check_output(["llvm-mca","-skip-unsupported-instructions=parse-failure","--json","-"]+target_args, input=asm.encode()))
+  data = json.loads(system("llvm-mca -skip-unsupported-instructions=parse-failure --json -"+target_args, input=asm.encode()))
   cr = data["CodeRegions"][0]
   resource_labels = [repr(x)[1:-1] for x in data["TargetInfo"]["Resources"]]
   rows:list = [[instr] for instr in cr["Instructions"]]
@@ -281,20 +315,19 @@ def get_stdout(f: Callable) -> str:
   except Exception: traceback.print_exc(file=buf)
   return buf.getvalue()
 
-def get_render(i:int, j:int, fmt:str) -> dict|None:
-  if fmt == "counters": return ctxs[i]["steps"][j]["data"]
-  if not isinstance(prg:=trace.keys[i].ret, ProgramSpec): return None
-  if fmt == "uops": return {"src":get_stdout(lambda: print_uops(prg.uops or [])), "lang":"txt"}
-  if fmt == "src": return {"src":prg.src, "lang":"cpp"}
-  compiler = Device[prg.device].compiler
-  disasm_str = get_stdout(lambda: compiler.disassemble(compiler.compile(prg.src)))
-  from tinygrad.runtime.support.compiler_cpu import llvm, LLVMCompiler
-  if isinstance(compiler, LLVMCompiler):
-    mtriple = ctypes.string_at(llvm.LLVMGetTargetMachineTriple(tm:=compiler.target_machine)).decode()
-    mcpu = ctypes.string_at(llvm.LLVMGetTargetMachineCPU(tm)).decode()
-    ret = get_llvm_mca(disasm_str, mtriple, mcpu)
-  else: ret = {"src":disasm_str, "lang":"x86asm"}
-  return ret
+def get_render(i:int, j:int, fmt:str) -> dict:
+  data = ctxs[i]["steps"][j]["data"]
+  if fmt == "uops": return {"src":get_stdout(lambda: print_uops(data.uops or [])), "lang":"txt"}
+  if fmt == "code": return {"src":data.src, "lang":"cpp"}
+  if fmt == "asm":
+    compiler = Device[data.device].compiler
+    disasm_str = get_stdout(lambda: compiler.disassemble(compiler.compile(data.src)))
+    from tinygrad.runtime.support.compiler_cpu import llvm, LLVMCompiler
+    if isinstance(compiler, LLVMCompiler):
+      return get_llvm_mca(disasm_str, ctypes.string_at(llvm.LLVMGetTargetMachineTriple(tm:=compiler.target_machine)).decode(),
+                          ctypes.string_at(llvm.LLVMGetTargetMachineCPU(tm)).decode())
+    return {"src":disasm_str, "lang":"x86asm"}
+  return data
 
 # ** HTTP server
 
@@ -313,13 +346,17 @@ class Handler(BaseHTTPRequestHandler):
         if url.path.endswith(".css"): content_type = "text/css"
       except FileNotFoundError: status_code = 404
     elif (query:=parse_qs(url.query)):
-      if url.path == "/render":
-        render_src = get_render(get_int(query, "ctx"), get_int(query, "step"), query["fmt"][0])
-        ret, content_type = json.dumps(render_src).encode(), "application/json"
-      else:
-        try: return self.stream_json(get_full_rewrite(trace.rewrites[i:=get_int(query, "ctx")][get_int(query, "idx")], i))
+      i, j = get_int(query, "ctx"), get_int(query, "step")
+      if (fmt:=url.path.lstrip("/")) == "rewrites":
+        try: return self.stream_json(get_full_rewrite(trace.rewrites[i][j], i))
         except (KeyError, IndexError): status_code = 404
-    elif url.path == "/ctxs": ret, content_type = json.dumps(ctxs).encode(), "application/json"
+      else:
+        render_src = get_render(i, j, fmt)
+        if "content_type" in render_src: ret, content_type = render_src["value"], render_src["content_type"]
+        else: ret, content_type = json.dumps(render_src).encode(), "application/json"
+    elif url.path == "/ctxs":
+      lst = [{**c, "steps":[{k:v for k, v in s.items() if k != "data"} for s in c["steps"]]} for c in ctxs]
+      ret, content_type = json.dumps(lst).encode(), "application/json"
     elif url.path == "/get_profile" and profile_ret: ret, content_type = profile_ret, "application/octet-stream"
     else: status_code = 404
 
