@@ -3,7 +3,7 @@ import os, math, sys
 from collections import defaultdict, Counter
 from tinygrad.codegen.opt import tc
 from tinygrad.uop.ops import GroupOp, Ops, UOp, PatternMatcher, UPat, range_str, axis_letters
-from tinygrad.helpers import strip_parens, getenv, prod, dedup, AMX, CPU_COUNT
+from tinygrad.helpers import strip_parens, getenv, prod, dedup, AMX, CPU_COUNT, ContextVar
 from tinygrad.dtype import ImageDType, dtypes, DType, PtrDType, AddrSpace, truncate
 from tinygrad.renderer import Renderer
 from tinygrad.codegen.late.devectorizer import no_vectorized_alu
@@ -92,6 +92,7 @@ def uops_to_dtypes(uops:list[UOp]) -> list[DType]: return dedup(u.dtype for u in
 def wmma_args(uops:list[UOp]):
   return dedup((uop.arg[0], uop.arg[1], uop.arg[2], uop.dtype.scalar(), *(uop.arg[4:8])) for uop in uops if uop.op is Ops.WMMA)
 
+REUSE_REGISTERS=ContextVar("REUSE_REGISTERS", 0)
 class CStyleLanguage(Renderer):
   kernel_typedef: str = "void"
   buffer_prefix: str = ""
@@ -145,8 +146,115 @@ class CStyleLanguage(Renderer):
       return prefix + self.render_dtype(dt.base) + "*"
     if dt.count > 1: return self.type_map.get(scalar:=dt.scalar(), scalar.name).replace(" ", "_") + str(dt.count)
     return self.type_map.get(scalar:=dt.scalar(), scalar.name)
+  def dtype_prefix(self, dt:DType)->str:
+    if isinstance(dt, ImageDType): raise NotImplementedError
+    if isinstance(dt, PtrDType): return self.dtype_prefix(dt.base) + "p"
+    if dt.count > 1:
+      scalar_fmt = dt.scalar().fmt if dt != dtypes.bool else "b"
+      assert scalar_fmt is not None, f"Invalid format for dtype {dt}"
+      return scalar_fmt + str(dt.count)
+    assert dt.fmt is not None, f"Invalid format for dtype {dt}"
+    return dt.fmt if dt != dtypes.bool else "b"
 
   def __getitem__(self, key): return self.r[key]  # hacky helper
+  def _reuse_registers(self, kernel: list[str], var_dtypes: dict[str, DType]) -> list[str]:
+    """Post-process kernel to reuse registers based on liveness analysis."""
+    import re
+
+    # Parse kernel lines to find definitions and uses
+    definitions: dict[str, int] = {}   # var_name -> line_index where defined
+    last_use: dict[str, int] = {}      # var_name -> line_index of last use
+
+    # Regex: captures "type varname =" but not "*ptr =" or "for (type var ="
+    def_pattern = re.compile(r'^\s*(\w+)\s+(\w+)\s*=')
+
+    for i, line in enumerate(kernel):
+      # Find definition (variable being assigned)
+      match = def_pattern.match(line)
+      if match and match.group(1) != 'for':  # skip for loop variable definitions
+        var_name = match.group(2)
+        if var_name in var_dtypes:  # only track variables we know about
+          definitions[var_name] = i
+
+      # Find uses of all known variables
+      for var_name in var_dtypes:
+        if re.search(rf'\b{re.escape(var_name)}\b', line):
+          last_use[var_name] = i
+
+    # Compute live ranges
+    live_ranges: dict[str, tuple[int, int]] = {}
+    for var_name, def_line in definitions.items():
+      end_line = last_use.get(var_name, def_line)
+      live_ranges[var_name] = (def_line, end_line)
+
+    # Group variables by (dtype, prefix) for register allocation
+    def get_prefix(name: str) -> str:
+      match = re.match(r'([a-zA-Z_]+)', name)
+      return match.group(1) if match else name
+
+    groups: dict[tuple[DType, str], list[str]] = {}
+    for var_name, dtype in var_dtypes.items():
+      if var_name in definitions:  # only variables that are defined
+        key = (dtype, get_prefix(var_name))
+        groups.setdefault(key, []).append(var_name)
+
+    # Linear scan register allocation per group
+    rename_map: dict[str, str] = {}
+    declarations: list[str] = []
+
+    for (dtype, prefix), var_names in groups.items():
+      # Sort by definition line
+      var_names.sort(key=lambda v: live_ranges[v][0])
+
+      # Allocate registers
+      registers: list[tuple[str, int]] = []  # (reg_name, end_line)
+      reg_count = 0
+      dtype_prefix = self.dtype_prefix(dtype)
+
+      for var_name in var_names:
+        def_line, end_line = live_ranges[var_name]
+
+        # Find a free register (one whose live range has ended)
+        allocated = False
+        for j, (reg_name, reg_end) in enumerate(registers):
+          if reg_end < def_line:  # Register is free
+            rename_map[var_name] = reg_name
+            registers[j] = (reg_name, end_line)
+            allocated = True
+            break
+
+        if not allocated:
+          # Create new register
+          new_reg = f"{dtype_prefix}_{prefix}_{reg_count}"
+          reg_count += 1
+          rename_map[var_name] = new_reg
+          registers.append((new_reg, end_line))
+
+      # Generate declaration for this group
+      if reg_count > 0:
+        reg_names = [f"{dtype_prefix}_{prefix}_{j}" for j in range(reg_count)]
+        declarations.append(f"  {self.render_dtype(dtype)} {', '.join(reg_names)};")
+
+    # Rename variables in kernel lines
+    new_kernel = []
+    for line in kernel:
+      # Remove type declaration from assignments (e.g., "float alu0 = " -> "f_alu_0 = ")
+      match = def_pattern.match(line)
+      if match and match.group(1) != 'for':
+        var_name = match.group(2)
+        if var_name in rename_map:
+          # Replace "type var_name = " with "new_name = "
+          line = re.sub(rf'^(\s*)\w+\s+{re.escape(var_name)}\s*=',
+                       rf'\g<1>{rename_map[var_name]} =', line)
+
+      # Replace all variable references
+      for old_name, new_name in rename_map.items():
+        line = re.sub(rf'\b{re.escape(old_name)}\b', new_name, line)
+
+      new_kernel.append(line)
+
+    # Prepend declarations
+    return declarations + new_kernel
   def _render(self, uops:list[UOp]) -> tuple[str, list[str], list[tuple[str,tuple[DType,bool]]]]:
     r: dict[UOp, str] = {}
     self.r = r
@@ -157,7 +265,8 @@ class CStyleLanguage(Renderer):
     depth = 1
     c: defaultdict[str, int] = defaultdict(int)
     name = "test"
-    for u in uops:
+    var_dtypes: dict[str, DType] = {}
+    for i,u in enumerate(uops):
       if u.op in {Ops.NOOP, Ops.GROUP}: continue
       if u.op is Ops.AFTER:
         r[u] = r[u.src[0]]
@@ -196,11 +305,16 @@ class CStyleLanguage(Renderer):
         r[u] = l
       else:
         if u.op in {Ops.RANGE, Ops.DEFINE_LOCAL, Ops.STORE, Ops.DEFINE_REG} or u.dtype == dtypes.void: pass
-        else: l = f"{self.render_dtype(u.dtype)} {r[u]} = {l}" + (";" if u.op is not Ops.SPECIAL else "")
+        else:
+          var_dtypes[r[u]] = u.dtype
+          l = f"{self.render_dtype(u.dtype)} {r[u]} = {l}" + (";" if u.op is not Ops.SPECIAL else "")
         kernel.append("  "*depth + l)
         if prefix: c[prefix] += 1  # if it was used, increment
       if u.op in {Ops.IF, Ops.RANGE}: depth += 1
     del self.r
+
+    if REUSE_REGISTERS:
+      kernel = self._reuse_registers(kernel,var_dtypes)
 
     # NOTE: this relies on bufs dict preserving order
     return (name, kernel, list(bufs.values()))
