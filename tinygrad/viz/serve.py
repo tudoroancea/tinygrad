@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import multiprocessing, pickle, difflib, os, threading, json, time, sys, webbrowser, socket, argparse, socketserver, functools, codecs, io, struct
-import ctypes, pathlib, traceback
-from contextlib import redirect_stdout, redirect_stderr
+import ctypes, pathlib, traceback, itertools
+from contextlib import redirect_stdout, redirect_stderr, contextmanager
 from decimal import Decimal
 from http.server import BaseHTTPRequestHandler
 from urllib.parse import parse_qs, urlparse
@@ -20,7 +20,7 @@ uops_colors = {Ops.LOAD: "#ffc0c0", Ops.STORE: "#87CEEB", Ops.CONST: "#e0e0e0", 
                Ops.INDEX: "#cef263", Ops.WMMA: "#efefc0", Ops.MULTI: "#f6ccff", Ops.KERNEL: "#3e7f55",
                **{x:"#FFB289" for x in GroupOp.VMap},
                **{x:"#D8F9E4" for x in GroupOp.Movement}, **{x:"#ffffc0" for x in GroupOp.ALU}, Ops.THREEFRY:"#ffff80",
-               Ops.BUFFER_VIEW: "#E5EAFF", Ops.BUFFER: "#B0BDFF", Ops.COPY: "#a040a0",
+               Ops.BUFFER_VIEW: "#E5EAFF", Ops.BUFFER: "#B0BDFF", Ops.COPY: "#a040a0", Ops.ENCDEC: "#bf71b6",
                Ops.ALLREDUCE: "#ff40a0", Ops.MSELECT: "#d040a0", Ops.MSTACK: "#d040a0", Ops.CONTIGUOUS: "#FFC14D",
                Ops.BUFFERIZE: "#FF991C", Ops.REWRITE_ERROR: "#ff2e2e", Ops.AFTER: "#8A7866", Ops.END: "#524C46"}
 
@@ -70,7 +70,7 @@ def uop_to_json(x:UOp) -> dict[int, dict]:
   excluded: set[UOp] = set()
   for u in (toposort:=x.toposort()):
     # always exclude DEVICE/CONST/UNIQUE
-    if u.op in {Ops.DEVICE, Ops.CONST, Ops.UNIQUE} and u is not x: excluded.add(u)
+    if u.op in {Ops.DEVICE, Ops.CONST, Ops.UNIQUE, Ops.LUNIQUE} and u is not x: excluded.add(u)
     if u.op is Ops.VCONST and u.dtype.scalar() == dtypes.index and u is not x: excluded.add(u)
     if u.op is Ops.VECTORIZE and len(u.src) == 0: excluded.add(u)
   for u in toposort:
@@ -180,12 +180,12 @@ def timeline_layout(dev_events:list[tuple[int, int, float, DevEvent]], start_ts:
   return struct.pack("<BI", 0, len(events))+b"".join(events) if events else None
 
 def encode_mem_free(key:int, ts:int, execs:list[ProfilePointEvent], scache:dict) -> bytes:
-  ei_encoding:list[tuple[int, int, int, int]] = [] # <[u32, u32, u8, u8] [run id, display name, buffer number and mode (2 = r/w, 1 = w, 0 = r)]
+  ei_encoding:list[tuple[int, int, int, int]] = [] # <[u32, u32, u32, u8] [run id, display name, buffer number and mode (2 = r/w, 1 = w, 0 = r)]
   for e in execs:
     num = next(i for i,k in enumerate(e.arg["bufs"]) if k == key)
     mode = 2 if (num in e.arg["inputs"] and num in e.arg["outputs"]) else 1 if (num in e.arg["outputs"]) else 0
     ei_encoding.append((e.key, enum_str(e.arg["name"], scache), num, mode))
-  return struct.pack("<BIII", 0, ts, key, len(ei_encoding))+b"".join(struct.pack("<IIBB", *t) for t in ei_encoding)
+  return struct.pack("<BIII", 0, ts, key, len(ei_encoding))+b"".join(struct.pack("<IIIB", *t) for t in ei_encoding)
 
 def mem_layout(dev_events:list[tuple[int, int, float, DevEvent]], start_ts:int, end_ts:int, peaks:list[int], dtype_size:dict[str, int],
                scache:dict[str, int]) -> bytes|None:
@@ -212,46 +212,91 @@ def mem_layout(dev_events:list[tuple[int, int, float, DevEvent]], start_ts:int, 
   peaks.append(peak)
   return struct.pack("<BIQ", 1, len(events), peak)+b"".join(events) if events else None
 
+# by default, VIZ does not start when there is an error
+# use this to instead display the traceback to the user
+@contextmanager
+def soft_err(fn:Callable):
+  try: yield
+  except Exception: fn({"src":traceback.format_exc()})
+
+def row_tuple(row:str) -> tuple[int, ...]: return tuple(int(x.split(":")[1]) for x in row.split())
+
+@soft_err(lambda err: ctxs.append({"name":"ERR", "steps":[create_step("Loader error", ("render",len(ctxs),0), err)]}))
 def load_sqtt(profile:list[ProfileEvent]) -> None:
-  from tinygrad.runtime.ops_amd import ProfileSQTTEvent
-  if not (sqtt_events:=[e for e in profile if isinstance(e, ProfileSQTTEvent)]): return None
-  def err(name:str, msg:str|None=None) -> None:
-    step = {"name":name, "data":{"src":msg or traceback.format_exc()}, "depth":0, "query":f"/render?ctx={len(ctxs)}&step=0&fmt=counters"}
-    return ctxs.append({"name":"Counters", "steps":[step]})
-  try: from extra.sqtt.roc import decode
-  except Exception: return err("DECODER IMPORT ISSUE")
-  try: rctx = decode(profile)
-  except Exception: return err("DECODER ERROR")
-  if not rctx.inst_execs: return err("EMPTY SQTT OUTPUT", f"{len(sqtt_events)} SQTT events recorded, none got decoded")
+  from tinygrad.runtime.ops_amd import ProfileSQTTEvent, ProfilePMCEvent
+  counter_events:dict[tuple[str, int], list[ProfileSQTTEvent|ProfilePMCEvent]] = {}
+  for e in profile:
+    if isinstance(e, (ProfilePMCEvent, ProfileSQTTEvent)): counter_events.setdefault((e.kern, e.exec_tag), []).append(e)
+  if not counter_events: return
+  # ** init decoder
+  from extra.sqtt.roc import decode
+  rctx = decode(profile)
+  if getenv("SQTT_PARSE"):
+    from extra.sqtt.attempt_sqtt_parse import parse_sqtt_print_packets
+    for counters in counter_events.values():
+      for e in counters:
+        if isinstance(e, ProfileSQTTEvent): parse_sqtt_print_packets(e.blob)
+  # ** decode traces for each run
   steps:list[dict] = []
-  units:set[str] = set()
-  for name,waves in rctx.inst_execs.items():
-    events:list[ProfileEvent] = []
-    prg = trace.keys[r].ret if (r:=ref_map.get(name)) else None
-    steps.append(first:=create_step(prg.name if prg is not None else name, ("/counters", len(ctxs), len(steps))))
-    # Idle:     The total time gap between the completion of previous instruction and the beginning of the current instruction.
-    #           The idle time can be caused by:
-    #             * Arbiter loss
-    #             * Source or destination register dependency
-    #             * Instruction cache miss
-    # Stall:    The total number of cycles the hardware pipe couldn't issue an instruction.
-    # Duration: Total latency in cycles, defined as "Stall time + Issue time" for gfx9 or "Stall time + Execute time" for gfx10+.
-    for w in waves:
-      units.add(row:=f"SE:{w.se} CU:{w.cu} SIMD:{w.simd} WAVE:{w.wave_id}")
-      events.append(ProfileRangeEvent(row, wave_name:="wave", Decimal(w.begin_time), Decimal(w.end_time)))
-      rows, prev_instr = [], w.begin_time
-      for i,e in enumerate(w.insts):
-        rows.append((e.inst, e.time, max(0, e.time-prev_instr), e.dur, e.stall, str(e.typ).split("_")[-1]))
-        prev_instr = max(prev_instr, e.time + e.dur)
-      summary = [{"label":"Total Cycles", "value":w.end_time-w.begin_time}, {"label":"SIMD", "value":w.simd}, {"label":"CU", "value":w.cu},
-                 {"label":"SE", "value":w.se}]
-      steps.append(create_step(wave_name, ("/counters", len(ctxs), len(steps)), depth=2,
-                               data={"rows":rows, "cols":["Instruction", "Clk", "Idle", "Duration", "Stall", "Type"], "summary":summary}))
-    events = [ProfilePointEvent(unit, "start", unit, ts=Decimal(0)) for unit in units]+events
-    first["data"] = {"value":get_profile(events, lambda k:tuple(int(x.split(":")[1]) for x in k.split())), "content_type":"application/octet-stream"}
+  for key,counters in counter_events.items():
+    # ** Run summary
+    program = trace.keys[r].ret if (r:=ref_map.get(key[0])) else None
+    summary = [f"{program.global_size=} {program.local_size=}"] if program else [repr(key)]
+    # ** SQTT events
+    disasm = rctx.disasms[key[0]]
+    cu_events:dict[str, list[ProfileEvent]] = {}
+    # * INST waves
+    wave_insts:dict[str, dict[str, dict]] = {}
+    inst_units:dict[str, itertools.count] = {}
+    for w in rctx.inst_execs.get(key, []):
+      if (u:=w.wave_loc) not in inst_units: inst_units[u] = itertools.count(0)
+      n = next(inst_units[u])
+      if (events:=cu_events.get(w.cu_loc)) is None: cu_events[w.cu_loc] = events = []
+      events.append(ProfileRangeEvent(w.simd_loc, loc:=f"INST WAVE:{w.wave_id} N:{n}", Decimal(w.begin_time), Decimal(w.end_time)))
+      wave_insts.setdefault(w.cu_loc, {})[f"{u} N:{n}"] = {"wave":w, "disasm":disasm, "run_number":n, "loc":loc}
+    # * OCC waves
+    units:dict[str, itertools.count] = {}
+    wave_start:dict[str, int] = {}
+    for occ in rctx.occ_events.get(key, []):
+      if (u:=occ.wave_loc) not in units: units[u] = itertools.count(0)
+      if u in inst_units: continue
+      if occ.start: wave_start[u] = occ.time
+      else:
+        if (events:=cu_events.get(occ.cu_loc)) is None: cu_events[occ.cu_loc] = events = []
+        events.append(ProfileRangeEvent(occ.simd_loc, f"OCC WAVE:{occ.wave_id} N:{next(units[u])}", Decimal(wave_start.pop(u)), Decimal(occ.time)))
+    prg_cu = sorted(cu_events, key=row_tuple)
+    if cu_events: summary.append(f"Scheduled on {len(prg_cu)} CUs")
+    steps.append(create_step(program.name if program else key[0], ("/prg-run", len(ctxs), len(steps)), {"src":"\n\n".join(summary)}, depth=0))
+    # ** PMC events
+    if (pmc_event:=next((e for e in counters if isinstance(e, ProfilePMCEvent)), None)) is not None:
+      agg_cols = ["Name", "Sum"]
+      sample_cols = ["XCC", "INST", "SE", "SA", "WGP", "Value"]
+      rows:list[list] = []
+      view, ptr = memoryview(pmc_event.blob).cast('Q'), 0
+      for s in pmc_event.sched:
+        row:list = [s.name, 0, {"cols":sample_cols, "rows":[]}]
+        for sample in itertools.product(range(s.xcc), range(s.inst), range(s.se), range(s.sa), range(s.wgp)):
+          row[1] += (val:=int(view[ptr]))
+          row[2]["rows"].append(sample+(val,))
+          ptr += 1
+        rows.append(row)
+      steps.append(create_step("PMC", ("/pmc", len(ctxs), len(steps)), {"rows":rows, "cols":agg_cols}, depth=1))
+    for cu in prg_cu:
+      events = [ProfilePointEvent(unit, "start", unit, ts=Decimal(0)) for unit in units]+cu_events[cu]
+      steps.append(create_step(f"{cu} {len(cu_events[cu])}", ("/counters", len(ctxs), len(steps)),
+                               {"value":get_profile(events, sort_fn=row_tuple), "content_type":"application/octet-stream"}, depth=1))
+      for k in sorted(wave_insts.get(cu, []), key=row_tuple):
+        data = wave_insts[cu][k]
+        steps.append(create_step(k.replace(cu, ""), ("/sqtt-insts", len(ctxs), len(steps)), data, loc=data["loc"], depth=2))
   ctxs.append({"name":"Counters", "steps":steps})
 
-def get_profile(profile:list[ProfileEvent], sort_fn:Callable[[str], Any]|None=None) -> bytes|None:
+def device_sort_fn(k:str) -> tuple[int, str, int]:
+  order = {"GC": 0, "USER": 1, "TINY": 2, "DISK": 999}
+  dname = k.split()[0]
+  dev_rank = next((v for k,v in order.items() if dname.startswith(k)), len(order))
+  return (dev_rank, dname, len(k))
+
+def get_profile(profile:list[ProfileEvent], sort_fn:Callable[[str], Any]=device_sort_fn) -> bytes|None:
   # start by getting the time diffs
   for ev in profile:
     if isinstance(ev,ProfileDeviceEvent): device_ts_diffs[ev.device] = (ev.comp_tdiff, ev.copy_tdiff if ev.copy_tdiff is not None else ev.comp_tdiff)
@@ -277,12 +322,12 @@ def get_profile(profile:list[ProfileEvent], sort_fn:Callable[[str], Any]|None=No
   scache:dict[str, int] = {}
   peaks:list[int] = []
   dtype_size:dict[str, int] = {}
-  for k in sorted(dev_events, key=sort_fn) if sort_fn else dev_events:
-    (v:=dev_events[k]).sort(key=lambda e:e[0])
+  for k,v in dev_events.items():
+    v.sort(key=lambda e:e[0])
     layout[k] = timeline_layout(v, start_ts, scache)
     layout[f"{k} Memory"] = mem_layout(v, start_ts, unwrap(end_ts), peaks, dtype_size, scache)
-  groups = sorted(layout.items(), key=lambda x: '' if len(ss:=x[0].split(" ")) == 1 else ss[1])
-  ret = [b"".join([struct.pack("<B", len(k)), k.encode(), v]) for k,v in groups if v is not None]
+  sorted_layout = sorted([k for k,v in layout.items() if v is not None], key=sort_fn)
+  ret = [b"".join([struct.pack("<B", len(k)), k.encode(), unwrap(layout[k])]) for k in sorted_layout]
   index = json.dumps({"strings":list(scache), "dtypeSize":dtype_size, "markers":[{"ts":int(e.ts-start_ts), **e.arg} for e in markers]}).encode()
   return struct.pack("<IQII", unwrap(end_ts)-start_ts, max(peaks,default=0), len(index), len(ret))+index+b"".join(ret)
 
@@ -306,7 +351,7 @@ def get_llvm_mca(asm:str, mtriple:str, mcpu:str) -> dict:
   summary = [{"idx":k, "label":resource_labels[k], "value":v} for k,v in instr_usage.pop(len(rows), {}).items()]
   max_usage = max([sum(v.values()) for i,v in instr_usage.items() if i<len(rows)], default=0)
   for i,usage in instr_usage.items(): rows[i].append([[k, v, (v/max_usage)*100] for k,v in usage.items()])
-  return {"rows":rows, "cols":["Opcode", "Latency", {"title":"HW Resources", "labels":resource_labels}], "summary":summary}
+  return {"rows":rows, "cols":["Instruction", "Latency", {"title":"HW Resources", "labels":resource_labels}], "metadata":[summary]}
 
 def get_stdout(f: Callable) -> str:
   buf = io.StringIO()
@@ -314,6 +359,18 @@ def get_stdout(f: Callable) -> str:
     with redirect_stdout(buf), redirect_stderr(buf): f()
   except Exception: traceback.print_exc(file=buf)
   return buf.getvalue()
+
+def amd_readelf(lib:bytes) -> list[dict]:
+  from tinygrad.runtime.support.elf import elf_loader
+  import msgpack
+  _, sections, __ = elf_loader(lib)
+  data = next((s for s in sections if s.name.startswith(".note"))).content
+  namesz, descsz, typ = struct.unpack_from(hdr:="<III", data, 0)
+  offset = (struct.calcsize(hdr)+namesz+3) & -4
+  notes = msgpack.unpackb(data[offset:offset+descsz])
+  keys = {".sgpr_count":"SGPRs", ".vgpr_count":"VGPRs", ".max_flat_workgroup_size":"Max WGP size",
+          ".group_segment_fixed_size":"LDS size", ".private_segment_fixed_size":"Scratch size"}
+  return [{"label":label, "value":v} for k,label in keys.items() if (v:=notes["amdhsa.kernels"][0][k]) > 0]
 
 def get_render(i:int, j:int, fmt:str) -> dict:
   data = ctxs[i]["steps"][j]["data"]
@@ -326,7 +383,38 @@ def get_render(i:int, j:int, fmt:str) -> dict:
     if isinstance(compiler, LLVMCompiler):
       return get_llvm_mca(disasm_str, ctypes.string_at(llvm.LLVMGetTargetMachineTriple(tm:=compiler.target_machine)).decode(),
                           ctypes.string_at(llvm.LLVMGetTargetMachineCPU(tm)).decode())
-    return {"src":disasm_str, "lang":"x86asm"}
+    metadata:list = []
+    if data.device.startswith("AMD"):
+      with soft_err(lambda err: metadata.append(err)):
+        metadata.append(amd_readelf(compiler.compile(data.src)))
+    return {"src":disasm_str, "lang":"amdgpu" if data.device.startswith("AMD") else None, "metadata":metadata}
+  if fmt == "sqtt-insts":
+    columns = ["PC", "Instruction", "Hits", "Duration", "Stall", "Type"]
+    inst_columns = ["N", "Clk", "Idle", "Dur", "Stall"]
+    # Idle:     The total time gap between the completion of previous instruction and the beginning of the current instruction.
+    #           The idle time can be caused by:
+    #             * Arbiter loss
+    #             * Source or destination register dependency
+    #             * Instruction cache miss
+    # Stall:    The total number of cycles the hardware pipe couldn't issue an instruction.
+    # Duration: Total latency in cycles, defined as "Stall time + Issue time" for gfx9 or "Stall time + Execute time" for gfx10+.
+    prev_instr = (w:=data["wave"]).begin_time
+    pc_to_inst = data["disasm"]
+    start_pc = None
+    rows:dict[int, dict] = {}
+    for e in w.unpack_insts():
+      if start_pc is None: start_pc = e.pc
+      if (inst:=rows.get(e.pc)) is None:
+        rows[e.pc] = inst = {"pc":e.pc-start_pc, "inst":pc_to_inst[e.pc][0], "hit_count":0, "dur":0, "stall":0, "type":str(e.typ).split("_")[-1],
+                             "hits":{"cols":inst_columns, "rows":[]}}
+      inst["hit_count"] += 1
+      inst["dur"] += e.dur
+      inst["stall"] += e.stall
+      inst["hits"]["rows"].append((inst["hit_count"]-1, e.time, max(0, e.time-prev_instr), e.dur, e.stall))
+      prev_instr = max(prev_instr, e.time + e.dur)
+    summary = [{"label":"Total Cycles", "value":w.end_time-w.begin_time}, {"label":"SE", "value":w.se}, {"label":"CU", "value":w.cu},
+               {"label":"SIMD", "value":w.simd}, {"label":"Wave ID", "value":w.wave_id}, {"label":"Run number", "value":data["run_number"]}]
+    return {"rows":[tuple(v.values()) for v in rows.values()], "cols":columns, "metadata":[summary]}
   return data
 
 # ** HTTP server
@@ -412,7 +500,7 @@ if __name__ == "__main__":
   st = time.perf_counter()
   print("*** viz is starting")
 
-  ctxs = get_rewrites(trace:=load_pickle(args.kernels, default=RewriteTrace([], [], {})))
+  ctxs:list[dict] = get_rewrites(trace:=load_pickle(args.kernels, default=RewriteTrace([], [], {})))
   profile_ret = get_profile(load_pickle(args.profile, default=[]))
 
   server = TCPServerWithReuse(('', PORT), Handler)
