@@ -252,5 +252,57 @@ class TestVmapNested(unittest.TestCase):
     np.testing.assert_allclose(result.numpy(), np.ones((3, 4, 2)) * 3)
 
 
+class TestVmapIndexing(unittest.TestCase):
+  """Tests for vmap with indexing operations."""
+
+  def test_simple_index(self):
+    """Test vmap over simple integer indexing."""
+    def fn(x):
+      return x[0]  # Get first element
+
+    vfn = vmap(fn)
+    x = Tensor.arange(15).reshape(5, 3).float()
+    result = vfn(x)
+    self.assertEqual(result.shape, (5,))
+    expected = np.array([0., 3., 6., 9., 12.])
+    np.testing.assert_allclose(result.numpy(), expected)
+
+  def test_slice_index(self):
+    """Test vmap over slice indexing."""
+    def fn(x):
+      return x[1:3]
+
+    vfn = vmap(fn)
+    x = Tensor.arange(20).reshape(5, 4).float()
+    result = vfn(x)
+    self.assertEqual(result.shape, (5, 2))
+
+  def test_tensor_index(self):
+    """Test vmap over tensor-based indexing."""
+    def fn(x, idx):
+      return x[idx]
+
+    vfn = vmap(fn)
+    x = Tensor.arange(15).reshape(5, 3).float()
+    idx = Tensor([0, 2, 1, 0, 2])  # Different index for each batch
+    result = vfn(x, idx)
+    self.assertEqual(result.shape, (5,))
+    # Expected: x[0,0], x[1,2], x[2,1], x[3,0], x[4,2] = 0, 5, 7, 9, 14
+    expected = np.array([0., 5., 7., 9., 14.])
+    np.testing.assert_allclose(result.numpy(), expected)
+
+  def test_multidim_index(self):
+    """Test vmap over multi-dimensional indexing."""
+    def fn(x):
+      return x[0, 1]
+
+    vfn = vmap(fn)
+    x = Tensor.arange(30).reshape(5, 2, 3).float()
+    result = vfn(x)
+    self.assertEqual(result.shape, (5,))
+    expected = np.arange(30).reshape(5, 2, 3)[:, 0, 1]
+    np.testing.assert_allclose(result.numpy(), expected)
+
+
 if __name__ == "__main__":
   unittest.main()
