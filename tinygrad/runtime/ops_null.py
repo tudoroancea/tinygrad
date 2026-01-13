@@ -4,7 +4,8 @@ from tinygrad.engine.jit import MultiGraphRunner
 from tinygrad.renderer.cstyle import Renderer, CStyleLanguage
 from tinygrad.renderer.llvmir import AMDLLVMRenderer
 from tinygrad.uop.ops import Ops
-from tinygrad.helpers import cpu_profile, EMULATE
+from tinygrad.helpers import cpu_profile, EMULATE, NULL_IR3, NULL_NAK
+from tinygrad.renderer.nir import IR3Renderer, NAKRenderer
 
 class NullRenderer(CStyleLanguage):
   device = "NULL"
@@ -27,7 +28,7 @@ class NullAllocator(Allocator['NullDevice']):
   def _offset(self, buf, offset:int, size:int): pass
 
 class NullGraph(MultiGraphRunner):
-  def __call__(self, input_rawbuffers, var_vals, wait=False) -> float|None: return 1e-1
+  def __call__(self, input_buffers, var_vals, wait=False) -> float|None: return 1e-1
 
 class NullDevice(Compiled):
   def __init__(self, device:str):
@@ -37,4 +38,6 @@ class NullDevice(Compiled):
       case "AMD_RDNA4": renderer = functools.partial(AMDLLVMRenderer, "gfx1201")
       case "": renderer = NullRenderer
       case _: raise RuntimeError(f"can't EMULATE device: {EMULATE.value}")
-    super().__init__(device, NullAllocator(self), CompilerSet([CompilerPair(renderer, Compiler)]), functools.partial(NullProgram, device), NullGraph)
+    compilers = CompilerSet([CompilerPair(renderer, Compiler), CompilerPair(functools.partial(IR3Renderer, 0x6030001), None, NULL_IR3), # adreno 630
+                             CompilerPair(functools.partial(NAKRenderer, "sm_120", 48), None, NULL_NAK)]) # 5090
+    super().__init__(device, NullAllocator(self), compilers, functools.partial(NullProgram, device), NullGraph)

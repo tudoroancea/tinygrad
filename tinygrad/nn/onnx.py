@@ -299,8 +299,8 @@ class OnnxPBParser:
     for fid, wire_type in self._parse_message(self._decode_end_pos()):
       match fid:
         case 1: obj["tensor_type"] = self._parse_TypeProtoTensor()
-        case 4: obj["sequence_type"] = self._parse_TypeProtoSequence()
-        case 9: obj["optional_type"] = self._parse_TypeProtoOptional()
+        case 4: obj["sequence_type"] = self._parse_TypeProtoWrapper()
+        case 9: obj["optional_type"] = self._parse_TypeProtoWrapper()
         case _: self.reader.skip_field(wire_type)
     return obj
 
@@ -313,15 +313,7 @@ class OnnxPBParser:
         case _: self.reader.skip_field(wire_type)
     return obj
 
-  def _parse_TypeProtoSequence(self) -> dict:
-    obj = {}
-    for fid, wire_type in self._parse_message(self._decode_end_pos()):
-      match fid:
-        case 1: obj["elem_type"] = self._parse_TypeProto()
-        case _: self.reader.skip_field(wire_type)
-    return obj
-
-  def _parse_TypeProtoOptional(self) -> dict:
+  def _parse_TypeProtoWrapper(self) -> dict:
     obj = {}
     for fid, wire_type in self._parse_message(self._decode_end_pos()):
       match fid:
@@ -369,6 +361,7 @@ required_input_python_consts: dict[str, tuple[int, ...]] = {
   "Tile": (1,), "Range": (0,1,2), "Expand": (1,), "Reshape": (1,), "Squeeze": (1,), "Unsqueeze": (1,), "Trilu": (1,), "ConstantOfShape": (0,),
   "CumSum": (1,), "TopK": (1,), "Pad": (1,2,3), "MaxUnpool": (2,), "Dropout": (1,2), "CenterCropPad": (1,), "OneHot": (1,), "Compress": (1,),
   "ImageDecoder": (0,), "AffineGrid": (1,), "Resize": (1,2,3), "Upsample": (1,), "Split": (1,), "Slice": (1,2,3,4),
+  "HannWindow": (0,), "HammingWindow": (0,), "BlackmanWindow": (0,),
   **{"Reduce"+r: (1,) for r in ("Max", "Min", "Sum", "Mean", "SumSquare", "Prod", "L1", "L2", "LogSum", "LogSumExp")},
   **{optim: (1,) for optim in ("Adam", "Adagrad", "Momentum")}
 }
@@ -413,7 +406,7 @@ class OnnxRunner:
     self.graph_nodes = tuple(n["parsed_node"] for n in graph["node"])
 
     self.old_training = Tensor.training
-    Tensor.training = True if self.is_training else False
+    Tensor.training = self.is_training
 
     self.variable_dims: dict[str, int] = {}
     self.onnx_ops = onnx_ops
@@ -498,13 +491,15 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
   def _axes(axes, noop_with_empty_axes): return axes or ([] if noop_with_empty_axes else None)
 
   # (padding_top, padding_left, ..., padding_bottom, padding_right, ...) -> (padding_left, padding_right, padding_top, padding_bottom, ...)
-  def _onnx_pads_to_tiny_pads(pads): return tuple(flatten(reversed(list(zip(pads, pads[len(pads)//2:])))))
+  def _onnx_pads_to_tiny_pads(pads):
+    n = len(pads) // 2
+    return tuple(x for i in range(n-1, -1, -1) for x in (pads[i], pads[i+n]))
 
   AUTO_PAD_OPTIONS = Literal["NOTSET", "SAME_UPPER", "SAME_LOWER", "VALID"]
   # (padding_height, padding_width) -> (padding_top, padding_left, padding_bottom, padding_right)
   def _auto_pad(pads, auto_pad: AUTO_PAD_OPTIONS):
-    if auto_pad == "SAME_UPPER": return [pads[i]//2 for i in range(len(pads))] + [pads[i]-pads[i]//2 for i in range(len(pads))]
-    return [pads[i]-pads[i]//2 for i in range(len(pads))] + [pads[i]//2 for i in range(len(pads))]
+    first = [p//2 for p in pads] if auto_pad == "SAME_UPPER" else [p - p//2 for p in pads]
+    return first + [p - f for p, f in zip(pads, first)]
 
   def _resolve_pool_pads(x:Tensor, p_, k_, d_, s_, auto_pad:AUTO_PAD_OPTIONS):
     if auto_pad == "VALID": return [0]*(len(k_)*2)
@@ -625,7 +620,9 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
   def LeakyRelu(X:Tensor, alpha:float=0.01): return X.leaky_relu(alpha)
   def ThresholdedRelu(X:Tensor, alpha:float=1.0): return (X > alpha).where(X, 0)
   def LogSoftmax(x: Tensor, axis:int=-1): return x.log_softmax(axis)
+  def Hardmax(x:Tensor, axis:int=-1): return x.argmax(axis).unsqueeze(axis)._one_hot_along_dim(x.shape[axis], dim=axis).cast(x.dtype)
   def Binarizer(x:Tensor, threshold:float=0.0): return (x > threshold).float()
+  def Swish(x:Tensor, alpha:float=1.0): return x * (x * alpha).sigmoid()
 
   # ***** Unary Ops (broadcasted) *****
   def Add(x:Tensor,y:Tensor, broadcast=None, axis=None): return x + y
@@ -646,7 +643,7 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
   def Mod(x:Tensor,y:Tensor,fmod=0): return x - x.div(y, rounding_mode="trunc") * y if fmod else x % y
 
   # ***** Casting Ops *****
-  # TODO: saturate
+  # NOTE: saturate only applies to FP8 types
   def Cast(x:Tensor, to:int, saturate:int=1): return x.cast(dtype_fallback(OnnxDataType(to).to_dtype(), "Cast op"))
   def CastLike(x:Tensor, target_type:Tensor, saturate:int=1): return x.cast(target_type.dtype)
 
@@ -698,8 +695,8 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
   def Concat(*xs:Tensor, axis:int): return Tensor.cat(*xs, dim=axis)
   def Slice(data:Tensor, starts:list[int], ends:list[int], axes:list[int]|None=None, steps:list[int]|None=None):
     axes = axes or list(range(data.ndim))
-    steps = steps or [1]*data.ndim
-    slices = [slice(0,x,1) for x in data.shape]
+    steps = steps or [1] * data.ndim
+    slices = [slice(None)] * data.ndim
     for i, axis in enumerate(axes): slices[axis] = slice(starts[i], ends[i], steps[i])
     return data[tuple(slices)]
 
@@ -809,7 +806,7 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
 
     input_shape = cast(tuple[int, ...], X.shape[2:])
     if scales is not None: assert all(sc==1 for sc in scales[:-len(input_shape)]), "resizing batch_size dim or channel dim not supported"
-    if sizes is not None: assert tuple(sizes[:-2]) == tuple(X.shape[X.ndim-len(sizes):-2]),  "resizing batch_size dim or channel dim not supported"
+    if sizes is not None: assert tuple(sizes[:-2]) == tuple(X.shape[X.ndim-len(sizes):-2]), "resizing batch_size dim or channel dim not supported"
 
     scales, sizes = (None if scales is None else scales[-len(input_shape):]), (None if sizes is None else sizes[-len(input_shape):])
     if sizes is not None:
@@ -933,11 +930,8 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
     # https://github.com/microsoft/onnxruntime/blob/main/docs/ContribOperators.md#com.microsoft.EmbedLayerNormalization
     assert (segment_ids is None) is (segment_embedding is None)
     assert mask is None and not mask_index_type, "functionality not supported yet"  # TODO
-    input_shape = input_ids.shape
-    seq_length = input_shape[1]
-    compute_seg_emb = (segment_embedding is not None and segment_ids is not None)
+    input_shape, seq_length = input_ids.shape, input_ids.shape[1]
     vocab_size, max_position_embeddings = word_embedding.shape[0], position_embedding.shape[0]
-    type_vocab_size  = (segment_embedding.shape[0] if compute_seg_emb else None)
 
     def embedding(x:Tensor, vocab_size, weight:Tensor) -> Tensor:
       return x.unsqueeze(-1).expand(*x.shape, vocab_size)._one_hot_along_dim(vocab_size) @ weight
@@ -946,15 +940,17 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
     if position_ids is None: position_ids = Tensor.arange(seq_length, requires_grad=False).unsqueeze(0).expand(*input_shape)
     wrd_embedding_res = embedding(input_ids, vocab_size, word_embedding)
     pos_embedding_res = embedding(position_ids, max_position_embeddings, position_embedding)
-    seg_embedding_res = embedding(segment_ids, type_vocab_size, segment_embedding) if compute_seg_emb else None
 
     embedding_sum = wrd_embedding_res + pos_embedding_res
-    if seg_embedding_res is not None: embedding_sum = embedding_sum + seg_embedding_res
+    if segment_embedding is not None: embedding_sum = embedding_sum + embedding(segment_ids, segment_embedding.shape[0], segment_embedding)
     out = embedding_sum.layernorm(eps=epsilon) * gamma + beta
     return out, None, embedding_sum
   def MeanVarianceNormalization(x:Tensor, axis:list[int]|None=None):
     if axis is None: axis = [0,2,3]
     return (x - x.mean(axis, keepdim=True)) / (x.std(axis, keepdim=True, correction=0) + 1e-9)
+
+  def LpNormalization(x:Tensor, axis:int=-1, p:int=2):
+    return x / (x.abs().sum(axis, keepdim=True) if p == 1 else x.square().sum(axis, keepdim=True).sqrt())
 
   def OneHot(indices:Tensor, depth:float|int|list[int|float], values:Tensor, axis:int=-1):
     # Scalar or Rank 1 tensor containing exactly one element
@@ -982,6 +978,15 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
   def dropout_6(data:Tensor, ratio:float=0.5, is_test=0): return dropout_7(data, ratio, training_mode=not is_test)
   Dropout = {OpSetId(Domain.ONNX, 6):dropout_6, OpSetId(Domain.ONNX, 7):dropout_7}
 
+  def _window(size, output_datatype, periodic, a):
+    size = int(_resolve_const(size))
+    N, n = (size if periodic else size - 1), Tensor.arange(size, requires_grad=False)
+    w = a[0] - a[1] * (n * (2 * math.pi / N)).cos() + a[2] * (n * (4 * math.pi / N)).cos()
+    return w.cast(dtype_fallback(OnnxDataType(output_datatype).to_dtype(), "window op"))
+  def HannWindow(size, output_datatype:int=1, periodic:int=1): return _window(size, output_datatype, periodic, (0.5, 0.5, 0))
+  def HammingWindow(size, output_datatype:int=1, periodic:int=1): return _window(size, output_datatype, periodic, (25/46, 21/46, 0))
+  def BlackmanWindow(size, output_datatype:int=1, periodic:int=1): return _window(size, output_datatype, periodic, (0.42, 0.5, 0.08))
+
   def LRN(x:Tensor, size:int, alpha:float=1e-4, beta:float=0.75, bias:float=1.0):
     pooled_x = (x**2).rearrange('b c h w -> b 1 c (h w)').pad((0,0,(size-1)//2, size//2)).avg_pool2d((size, 1), 1)
     return x / (pooled_x.reshape(x.shape) * alpha + bias).pow(beta)
@@ -1003,7 +1008,7 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
     return (base_grid @ theta.transpose(1, 2)).reshape(N, *spatial_dims, -1)
 
   def attention_contrib(x:Tensor, weights:Tensor, bias:Tensor|None=None, mask_index:Tensor|None=None, past:Tensor|None=None,
-                        attention_bias:Tensor|None=None, past_sequence_length:Tensor|None=None,  do_rotary:int=0, mask_filter_value:float=-10000.0,
+                        attention_bias:Tensor|None=None, past_sequence_length:Tensor|None=None, do_rotary:int=0, mask_filter_value:float=-10000.0,
                         num_heads:int|None=None, past_present_share_buffer:int|None=None, qkv_hidden_sizes:list[int]|None=None,
                         rotary_embedding_dim:int|None=None, scale:float|None=None, unidirectional:int=0):
     assert not do_rotary and not attention_bias, "TODO"
@@ -1049,14 +1054,15 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
     return output, present
 
   def attention_onnx(Q:Tensor, K:Tensor, V:Tensor, attn_mask:Tensor|None=None, past_key:Tensor|None=None, past_value:Tensor|None=None,
-                     is_causal:int=0, kv_num_heads:int|None=None, q_num_heads:int|None=None, qk_matmul_output_mode:int=0, scale:float|None=None,
-                     softcap:float=0.0, softmax_precision:int|None=None):
+                     nonpad_kv_seqlen:Tensor|None=None, is_causal:int=0, kv_num_heads:int|None=None, q_num_heads:int|None=None,
+                     qk_matmul_output_mode:int=0, scale:float|None=None, softcap:float=0.0, softmax_precision:int|None=None):
+    if nonpad_kv_seqlen is not None: raise NotImplementedError("nonpad_kv_seqlen is not supported")
     input_shape_len = Q.ndim
     if input_shape_len == 3:
       assert q_num_heads is not None and kv_num_heads is not None
-      Q = Q.reshape(Q.shape[0], q_num_heads, Q.shape[1], -1)
-      K = K.reshape(K.shape[0], kv_num_heads, K.shape[1], -1)
-      V = V.reshape(V.shape[0], kv_num_heads, V.shape[1], -1)
+      Q = Q.reshape(Q.shape[0], Q.shape[1], q_num_heads, -1).permute(0, 2, 1, 3)
+      K = K.reshape(K.shape[0], K.shape[1], kv_num_heads, -1).permute(0, 2, 1, 3)
+      V = V.reshape(V.shape[0], V.shape[1], kv_num_heads, -1).permute(0, 2, 1, 3)
 
     if past_key is not None: K = past_key.cat(K, dim=2)
     if past_value is not None: V = past_value.cat(V, dim=2)
@@ -1171,6 +1177,17 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
       elif reduction == "min": x[i] = x[i].minimum(u)
     return x
 
+  def TensorScatter(data: Tensor, updates: Tensor, indices: Tensor, mode: str = 'default'):
+    # scatter updates along axis -2 at positions given by indices, for each batch
+    B, U, D = indices.shape[0], updates.shape[-2], data.shape[-2]
+    orig_shape, data_flat, updates_flat = data.shape, data.reshape(-1, D, data.shape[-1]), updates.reshape(-1, U, updates.shape[-1])
+    B_total = data_flat.shape[0]
+    batch_idx = Tensor.arange(B_total, device=data.device).reshape(B_total, 1).expand(B_total, U)
+    indices_expanded = indices.reshape(B, *([1] * (data.ndim - 3))).expand(*orig_shape[:-2]).reshape(B_total)
+    row_idx = indices_expanded.reshape(B_total, 1).expand(B_total, U) + Tensor.arange(U, device=data.device).reshape(1, U).expand(B_total, U)
+    if mode == 'circular': row_idx = row_idx % D
+    return ScatterND(data_flat, batch_idx.unsqueeze(-1).cat(row_idx.unsqueeze(-1), dim=-1), updates_flat).reshape(orig_shape)
+
   def ScatterElements(x: Tensor, indices: Tensor, updates: Tensor, axis=0, reduction:Literal["none", "add", "mul", "min", "max"]="none"):
     indices = (indices < 0).where(x.shape[axis], 0) + indices
     if reduction == "none": return x.scatter(axis, indices, updates)
@@ -1228,8 +1245,9 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
     return _qlinearop_quantized(Tensor.mul, [a,b], [a_zero_point,b_zero_point], [a_scale,b_scale], c_scale, c_zero_point)
 
   def QLinearGlobalAveragePool(X:Tensor, x_scale:Tensor, x_zero_point:Tensor, y_scale:Tensor, y_zero_point:Tensor, channels_last:int):
-    assert channels_last == 0, "TODO NHWC"
-    return _qlinearop_float(GlobalAveragePool, [X], [x_zero_point], [x_scale], y_scale, y_zero_point)
+    if channels_last: X = X.permute(0, X.ndim-1, *range(1, X.ndim-1))  # NHWC -> NCHW
+    ret = _qlinearop_float(GlobalAveragePool, [X], [x_zero_point], [x_scale], y_scale, y_zero_point)
+    return ret.permute(0, *range(2, ret.ndim), 1) if channels_last else ret  # NCHW -> NHWC
 
   def ConvInteger(x: Tensor, w: Tensor, x_zero_point:Tensor = Tensor(0), w_zero_point:Tensor = Tensor(0), B: Tensor | None = None, **opts) -> Tensor:
     return _op_integer(Conv, [x,w], [x_zero_point,w_zero_point], **{"B":B, **opts})
@@ -1287,7 +1305,7 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
     # Tensor ops
     **{op: getattr(Tensor, op.lower()) for op in ("Neg", "Reciprocal", "Pow", "Sqrt", "Sign", "Abs", "Exp", "Log", "Mish", "Sin", "Cos", "Tan",
     "Asin", "Acos", "Atan", "Relu", "Sigmoid", "MatMul", "Floor", "Ceil", "IsNaN", "Softplus", "HardSwish", "Where", "Mul", "Sinh", "Cosh",
-    "Tanh", "Softsign", "Asinh", "Acosh", "Atanh",  "Elu", "Celu", "Selu", "Round", "Erf")},
+    "Tanh", "Softsign", "Asinh", "Acosh", "Atanh", "Elu", "Celu", "Selu", "Round", "Erf")},
     # Implemented ops
     **{name:obj for name,obj in locals().items() if isinstance(obj, types.FunctionType) and not name.startswith("_") and name[0].isupper()},
     # Version ops

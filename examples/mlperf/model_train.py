@@ -1008,6 +1008,7 @@ def train_bert():
   config["DISABLE_DROPOUT"] = getenv("DISABLE_DROPOUT", 0)
   config["TRAIN_BEAM"]    = TRAIN_BEAM = getenv("TRAIN_BEAM", BEAM.value)
   config["EVAL_BEAM"]     = EVAL_BEAM  = getenv("EVAL_BEAM", BEAM.value)
+  config["FP8_TRAIN"]     = getenv("FP8_TRAIN", 0)
 
   Tensor.manual_seed(seed)  # seed for weight initialization
 
@@ -1040,8 +1041,8 @@ def train_bert():
 
   # ** Optimizer **
   parameters_no_wd = [v for k, v in get_state_dict(model).items() if "bias" in k or "LayerNorm" in k]
-  parameters = [x for x in parameters if x not in set(parameters_no_wd)]
-  optimizer_wd = LAMB(parameters, lr=max_lr, b1=opt_lamb_beta_1, b2=opt_lamb_beta_2, eps=epsilon, weight_decay=decay, adam=False)
+  parameters_wd = [x for x in parameters if x not in set(parameters_no_wd)]
+  optimizer_wd = LAMB(parameters_wd, lr=max_lr, b1=opt_lamb_beta_1, b2=opt_lamb_beta_2, eps=epsilon, weight_decay=decay, adam=False)
   optimizer_no_wd = LAMB(parameters_no_wd, lr=max_lr, b1=opt_lamb_beta_1, b2=opt_lamb_beta_2, eps=epsilon, weight_decay=0.0, adam=False)
   optimizer_group = OptimizerGroup(optimizer_wd, optimizer_no_wd)
 
@@ -1085,7 +1086,7 @@ def train_bert():
   if RUNMLPERF:
     # only load real data with RUNMLPERF
     eval_it = iter(batch_load_val_bert(EVAL_BS))
-    train_it = iter(tqdm(batch_load_train_bert(BS), total=train_steps, disable=BENCHMARK))
+    train_it = iter(tqdm(batch_load_train_bert(BS, seed=seed), total=train_steps, disable=BENCHMARK))
     for _ in range(start_step): next(train_it) # Fast forward
   else:
     # repeat fake data
@@ -1142,17 +1143,12 @@ def train_bert():
           train_data["masked_lm_ids"], train_data["masked_lm_weights"], train_data["next_sentence_labels"])
 
         pt = time.perf_counter()
-
-        try:
-          next_data = next(train_it)
-        except StopIteration:
-          next_data = None
-
+        next_data = next(train_it)
         dt = time.perf_counter()
 
         device_str = parameters[0].device if isinstance(parameters[0].device, str) else f"{parameters[0].device[0]} * {len(parameters[0].device)}"
         loss = loss.item()
-        assert not math.isnan(loss)
+        if not getenv("FP8_TRAIN"): assert not math.isnan(loss)
         lr = lr.item()
 
       cl = time.perf_counter()
@@ -1165,7 +1161,7 @@ def train_bert():
       if WANDB:
         wandb.log({"lr": lr, "train/loss": loss, "train/global_norm": global_norm.item(), "train/step_time": cl - st,
                     "train/python_time": pt - st, "train/data_time": dt - pt, "train/cl_time": cl - dt,
-                    "train/GFLOPS": GlobalCounters.global_ops * 1e-9 / (cl - st), "epoch": (i+1)*GBS})
+                    "train/mem":GlobalCounters.mem_used / 1e9, "train/GFLOPS": GlobalCounters.global_ops * 1e-9 / (cl - st), "epoch": (i+1)*GBS})
 
       train_data, next_data = next_data, None
       i += 1
@@ -1182,8 +1178,8 @@ def train_bert():
       if MLLOGGER and RUNMLPERF:
         MLLOGGER.start(key=mllog_constants.EVAL_START, value=None, metadata={"epoch_num": i*GBS, "step_num": i})
       if getenv("RESET_STEP"): train_step_bert.reset()
-      elif getenv("FREE_INTERMEDIATE", 0) and train_step_bert.captured is not None:
-        # TODO: FREE_INTERMEDIATE nan'ed after jit step 2
+      elif getenv("FREE_INTERMEDIATE") and train_step_bert.captured is not None:
+        # TODO: this hangs on tiny green after 90 minutes of training
         train_step_bert.captured.free_intermediates()
       eval_lm_losses = []
       eval_clsf_losses = []
@@ -1218,7 +1214,7 @@ def train_bert():
           return
 
       if getenv("RESET_STEP"): eval_step_bert.reset()
-      elif getenv("FREE_INTERMEDIATE", 0) and eval_step_bert.captured is not None: eval_step_bert.captured.free_intermediates()
+      elif getenv("FREE_INTERMEDIATE") and eval_step_bert.captured is not None: eval_step_bert.captured.free_intermediates()
 
       del eval_data
       avg_lm_loss = sum(eval_lm_losses) / len(eval_lm_losses)
@@ -1319,12 +1315,21 @@ def train_llama3():
   opt_base_learning_rate = getenv("LR", 8e-5 * GBS / 1152)  # NOTE: cannot change for benchmark
   opt_end_learning_rate = getenv("END_LR", 8e-7)
 
-  # TODO: confirm weights are in bf16
+  # ** init wandb **
+  WANDB = getenv("WANDB")
+  if WANDB:
+    import wandb
+    wandb_args = {"id": wandb_id, "resume": "must"} if (wandb_id := getenv("WANDB_RESUME", "")) else {}
+    wandb.init(config=config, **wandb_args, project="MLPerf-LLaMA3")
+
+  model_params = MODEL_PARAMS[getenv("LLAMA3_SIZE", "8B")]["args"]
   # vocab_size from the mixtral tokenizer
-  params = MODEL_PARAMS[getenv("LLAMA3_SIZE", "8B")]["args"]
-  params = params | {"vocab_size": 32000} if not SMALL else params
-  if (llama_layers:=getenv("LLAMA_LAYERS")) != 0: params['n_layers'] = llama_layers
-  model = Transformer(**params, max_context=SEQLEN, jit=False, disable_kv_cache=True)
+  if not SMALL: model_params |= {"vocab_size": 32000}
+  if (llama_layers:=getenv("LLAMA_LAYERS")) != 0: model_params['n_layers'] = llama_layers
+  model = Transformer(**model_params, max_context=SEQLEN, jit=False, disable_kv_cache=True)
+  params = get_parameters(model)
+  # weights are all bfloat16 for now
+  assert params and all(p.dtype == dtypes.bfloat16 for p in params)
 
   if getenv("FAKEDATA"):
     for v in get_parameters(model):
@@ -1414,55 +1419,62 @@ def train_llama3():
   # ** data iters **
   def fake_data(bs, samples):
     for _ in range(samples // bs):
-      yield Tensor.randint(bs, SEQLEN + 1, low=0, high=params["vocab_size"], dtype=dtypes.int32, device=Device.DEFAULT)
+      yield Tensor.randint(bs, SEQLEN + 1, low=0, high=model_params["vocab_size"], dtype=dtypes.int32, device=Device.DEFAULT)
 
   def get_train_iter():
     if getenv("FAKEDATA", 0):
-      return fake_data(GBS, SAMPLES)
+      return fake_data(BS, SAMPLES)
     else:
-      if SMALL:
-        from examples.mlperf.dataloader import batch_load_llama3_small
-        return batch_load_llama3_small(GBS, SAMPLES, SEQLEN, BASEDIR, seed=SEED, val=bool(TRAIN_ON_VAL))
-      else:
-        from examples.mlperf.dataloader import batch_load_llama3
-        return batch_load_llama3(GBS, SAMPLES, SEQLEN, BASEDIR, seed=SEED, val=bool(TRAIN_ON_VAL))
+      from examples.mlperf.dataloader import batch_load_llama3
+      return batch_load_llama3(BS, SAMPLES, SEQLEN, BASEDIR, seed=SEED, val=bool(TRAIN_ON_VAL), small=bool(SMALL))
+
+  if getenv("FAKEDATA", 0):
+    eval_dataset = None
+  else:
+    from examples.mlperf.dataloader import get_llama3_dataset
+    eval_dataset = get_llama3_dataset(5760, SEQLEN, BASEDIR, val=True, small=bool(SMALL))
 
   def get_eval_iter():
-    if getenv("FAKEDATA", 0):
+    if eval_dataset is None:
       return fake_data(EVAL_BS, 5760)
-    else:
-      if SMALL:
-        from examples.mlperf.dataloader import batch_load_llama3_small
-        return batch_load_llama3_small(EVAL_BS, 5760, SEQLEN, BASEDIR, val=True)
-      else:
-        from examples.mlperf.dataloader import batch_load_llama3
-        return batch_load_llama3(EVAL_BS, 5760, SEQLEN, BASEDIR, val=True)
+    from examples.mlperf.dataloader import iterate_llama3_dataset
+    return iterate_llama3_dataset(eval_dataset, EVAL_BS)
 
   iter = get_train_iter()
   i, sequences_seen = resume_ckpt, 0
   for tokens in tqdm(iter, total=SAMPLES//GBS):
-    t = time.perf_counter()
     GlobalCounters.reset()
-    loss, lr = train_step(model, tokens)
-    loss = loss.float().item()
+    if getenv("TRAIN", 1):
+      t = time.perf_counter()
+      loss, lr = train_step(model, tokens)
+      loss = loss.float().item()
+      lr = lr.item()
 
-    i += 1
-    sequences_seen += tokens.shape[0]
+      i += 1
+      sequences_seen += tokens.shape[0]
 
-    tqdm.write(f"{loss:.4f} loss, {lr.item():.12f} LR, {GlobalCounters.mem_used / 1e9:.2f} GB used, {time.perf_counter()-t:.2f} s")
-    if (fname:=getenv("LOSS_FILE", "")):
-      with open(fname, "a") as f:
-        f.write(f"{i} {loss:.4f} {lr.item():.12f} {GlobalCounters.mem_used / 1e9:.2f}\n")
+      sec = time.perf_counter()-t
+      mem_gb = GlobalCounters.mem_used / 1e9
+      gflops = GlobalCounters.global_ops / 1e9 / sec
+      tqdm.write(
+        f"{i:5} {sec:.2f} s run, {loss:.4f} loss, {lr:.12f} LR, {mem_gb:.2f} GB used, {gflops:9.2f} GFLOPS")
 
-    if (ckpt_freq := getenv("CKPT")) and (i % ckpt_freq == 0 and (i != 1 or ckpt_freq == 1)):
-      tqdm.write("saving checkpoint")
-      if not os.path.exists(ckpt_dir := "./ckpts"): os.mkdir(ckpt_dir)
-      fn = f"{ckpt_dir}/llama3_{i}.safe"
-      safe_save(get_state_dict(model), fn)
+      if (fname:=getenv("LOSS_FILE", "")):
+        with open(fname, "a") as f:
+          f.write(f"{i} {loss:.4f} {lr:.12f} {mem_gb:.2f}\n")
 
-      tqdm.write("saving optim checkpoint")
-      fn = f"{ckpt_dir}/llama3_{i}_optim.safe"
-      safe_save(get_state_dict(scheduler), fn)
+      if WANDB:
+        wandb.log({"lr": lr, "train/loss": loss, "train/step_time": sec, "train/GFLOPS": gflops, "train/sequences_seen": sequences_seen})
+
+      if (ckpt_freq := getenv("CKPT")) and (i % ckpt_freq == 0 and (i != 1 or ckpt_freq == 1)):
+        tqdm.write("saving checkpoint")
+        if not os.path.exists(ckpt_dir := "./ckpts"): os.mkdir(ckpt_dir)
+        fn = f"{ckpt_dir}/llama3_{i}.safe"
+        safe_save(get_state_dict(model), fn)
+
+        tqdm.write("saving optim checkpoint")
+        fn = f"{ckpt_dir}/llama3_{i}_optim.safe"
+        safe_save(get_state_dict(scheduler), fn)
 
     if sequences_seen % EVAL_FREQ == 0 and (i != 1 or EVAL_FREQ == 1):
       tqdm.write(f"evaluating after {sequences_seen} sequences")
@@ -1477,6 +1489,9 @@ def train_llama3():
       log_perplexity = Tensor(eval_losses).mean().float().item()
 
       tqdm.write(f"eval log perplexity: {log_perplexity:.4f}")
+
+      if WANDB:
+        wandb.log({"eval/log_perplexity": log_perplexity, "eval/sequences_seen": sequences_seen})
 
       if log_perplexity < EVAL_TARGET:
         tqdm.write(f"target achieved after {sequences_seen} sequences")

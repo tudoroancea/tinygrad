@@ -1,7 +1,7 @@
 import numpy as np
 import torch
 import unittest, copy, mmap, random, math, array
-from tinygrad import Tensor, Device, dtypes
+from tinygrad import Tensor, Device, dtypes, nn
 from tinygrad.tensor import _METADATA
 from tinygrad.helpers import Context, getenv, temp, mv_address
 from extra.gradcheck import numerical_jacobian, jacobian, gradcheck
@@ -10,7 +10,7 @@ from tinygrad.device import is_dtype_supported
 from tinygrad.uop.ops import Ops, UOp
 from tinygrad.renderer.ptx import PTXRenderer
 from tinygrad.renderer.nir import NIRRenderer
-from tinygrad.codegen import full_rewrite
+from tinygrad.engine.realize import get_program
 from tinygrad.dtype import DType
 
 settings.register_profile("my_profile", max_examples=200, deadline=None, derandomize=getenv("DERANDOMIZE_CI", False))
@@ -70,15 +70,15 @@ class TestTinygrad(unittest.TestCase):
     out = out.log_softmax()
     out = out.mul(m).add(m).sum()
     out.backward()
-    xgrad,wgrad = x.grad, W.grad
+    xgrad, wgrad = x.grad.numpy(), W.grad.numpy()
     out.backward()
-    xgrad2,wgrad2 = x.grad, W.grad
+    xgrad2, wgrad2 = x.grad.numpy(), W.grad.numpy()
     out.backward() # no need to retain again since we will not re-run backward
-    xgrad3,wgrad3 = x.grad, W.grad
-    np.testing.assert_allclose(xgrad3.numpy(), xgrad.numpy() * 3., atol=1e-6)
-    np.testing.assert_allclose(wgrad3.numpy(), wgrad.numpy() * 3., atol=1e-6)
-    np.testing.assert_allclose(xgrad2.numpy(), xgrad.numpy() * 2., atol=1e-6)
-    np.testing.assert_allclose(wgrad2.numpy(), wgrad.numpy() * 2., atol=1e-6)
+    xgrad3, wgrad3 = x.grad.numpy(), W.grad.numpy()
+    np.testing.assert_allclose(xgrad3, xgrad * 3., atol=1e-6)
+    np.testing.assert_allclose(wgrad3, wgrad * 3., atol=1e-6)
+    np.testing.assert_allclose(xgrad2, xgrad * 2., atol=1e-6)
+    np.testing.assert_allclose(wgrad2, wgrad * 2., atol=1e-6)
 
   def test_second_order_backward_pass(self):
     def test_pytorch():
@@ -151,7 +151,6 @@ class TestTinygrad(unittest.TestCase):
     for x,y in zip(test_tinygrad(), test_pytorch()):
       np.testing.assert_allclose(x, y, atol=1e-5, rtol=1e-6)
 
-  @unittest.expectedFailure
   def test_const_backward_pass(self):
     init = 3.5
 
@@ -165,6 +164,30 @@ class TestTinygrad(unittest.TestCase):
     def test_tinygrad():
       w1 = Tensor(init, requires_grad=True)
       w2 = Tensor(init, requires_grad=True)
+      out = w1.add(w2)
+      out.backward()
+      return w1.grad.numpy(), w2.grad.numpy()
+
+    for x, y in zip(test_tinygrad(), test_pytorch()):
+      np.testing.assert_allclose(x, y, atol=1e-5)
+
+  def test_const_backward_pass_optimizer(self):
+    init = 3.5
+
+    def test_pytorch():
+      w1 = torch.tensor(init, requires_grad=True)
+      w2 = torch.tensor(init, requires_grad=True)
+      out = w1.add(w2)
+      out.backward()
+      return w1.grad.numpy(), w2.grad.numpy()
+
+    def test_tinygrad():
+      w1 = Tensor(init)
+      w2 = Tensor(init)
+      assert w1.requires_grad is None and w2.requires_grad is None
+      # optimizer sets requires_grad=True for params with requires_grad=None
+      nn.optim.SGD([w1, w2], lr=0.01)
+      assert w1.requires_grad is True and w2.requires_grad is True
       out = w1.add(w2)
       out.backward()
       return w1.grad.numpy(), w2.grad.numpy()
@@ -869,9 +892,8 @@ class TestIdxUpcast(unittest.TestCase):
     for s in schedule:
       if s.ast.op is Ops.SINK:
         renderer = Device[s.bufs[0].device].renderer
-        uops = full_rewrite(s.ast, renderer)
-        renderer.render(uops)
-        return uops
+        prg = get_program(s.ast, renderer)
+        return prg.uops
 
   def _assert(self, dtype: DType, a: Tensor):
     uops = self._schedule_render(a)
