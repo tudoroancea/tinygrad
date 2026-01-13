@@ -101,8 +101,13 @@ Handle remaining operations.
   - Pass through batch axis
 - [ ] **5.2** `COPY`
   - Preserve batch axis through device copy
-- [ ] **5.3** Handle constants properly
+- [x] **5.3** Handle constants properly
   - When used with batched tensors, broadcast correctly
+- [x] **5.4** Indexing operations
+  - Simple integer indexing via SHRINK
+  - Slice indexing
+  - Tensor-based indexing
+  - Multi-dimensional indexing
 
 ---
 
