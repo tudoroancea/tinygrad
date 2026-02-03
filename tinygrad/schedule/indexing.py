@@ -266,9 +266,14 @@ def run_rangeify(tsink:UOp, debug:bool=False) -> tuple[UOp, IndexingContext]:
 
     # vmapin/out
     if x.op == Ops.VMAPIN:
-      # insert back outerworld ranges
+      # insert back outerworld ranges, converting LOOP ranges to OUTER so they can remain open during kernel splitting
       out_rngs_iter = iter(out_rngs)
-      rngs = tuple(a if a.op == Ops.RANGE else next(out_rngs_iter) for a in x.src[1:])
+      def _to_outer(a):
+        if a.op != Ops.RANGE: return next(out_rngs_iter)
+        # convert LOOP to OUTER for vmap ranges so split_store allows them to remain open
+        if a.arg[-1] == AxisType.LOOP: return a.replace(arg=a.arg[:-1] + (AxisType.OUTER,))
+        return a
+      rngs = tuple(_to_outer(a) for a in x.src[1:])
     elif x.op == Ops.VMAPOUT:
       # remove outerworld ranges
       assert len(x.src[0].shape) == x.src[1:].count(UOp.const(dtypes.index, 0))
