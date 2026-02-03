@@ -308,6 +308,14 @@ def bufferize_to_store(ctx:itertools.count, x:UOp, idx:UOp, allow_locals=True):
   #assert isinstance(x.tag, Flat), "bufferize must be flat"
   size = prod(x.shape)
   rngs = sorted(idx.ranges, key=lambda x: x.arg)
+
+  # for global stores, close all non-OUTER ranges the store value depends on (includes vmap ranges hidden by VMAPOUT)
+  if x.arg.addrspace == AddrSpace.GLOBAL:
+    value_ranges = [r for r in x.src[0].ranges if r.op is Ops.RANGE and r.arg[-1] != AxisType.OUTER]
+    for r in value_ranges:
+      if r not in rngs: rngs.append(r)
+    rngs = sorted(rngs, key=lambda x: x.arg)
+
   assert size > 0 and isinstance(size, int), f"no zero sized or symbolic sized buffers {size}"
 
   sdtype = x.dtype.ptr(size=size, addrspace=x.arg.addrspace)
