@@ -46,6 +46,7 @@ class BufferizeOpts:
 class IndexingContext:
   realize_map: dict[UOp, None|list[int]] = field(default_factory=dict)
   range_map: dict[UOp, tuple[tuple[UOp, ...], tuple[UOp, ...]]] = field(default_factory=dict)
+  vmap_map: dict[UOp, tuple[UOp, ...]] = field(default_factory=dict)  # active vmap ranges per node
 
   # create ranges
   range_idx: Iterator[int] = field(default_factory=itertools.count)
@@ -66,6 +67,10 @@ def create_bufferize_and_index_based_on_ranges(ctx:IndexingContext, x:UOp):
       realized_ranges = ctx.realize_map[s]
       assert isinstance(realized_ranges, list), "realize map must contain range list"
       closed_ranges = tuple([r for i,r in enumerate(ctx.range_map[s][1]) if i in realized_ranges])
+      # for realized nodes inside a vmap scope (but not VMAPOUT itself), prepend vmap ranges
+      # so the intermediate buffer includes the batch dimension
+      s_vmap = ctx.vmap_map.get(s, ()) if s.op != Ops.VMAPOUT else ()
+      closed_ranges = s_vmap + closed_ranges
       if s.op is Ops.STORE:
         # add the ends if this is a store
         new_src = s.end(*[r for r in closed_ranges if r.op is Ops.RANGE])
@@ -77,7 +82,13 @@ def create_bufferize_and_index_based_on_ranges(ctx:IndexingContext, x:UOp):
         opts = BufferizeOpts(device=s.device, removable=removable) if len(ctx.range_map[s][1]) == len(realized_ranges) else \
                BufferizeOpts(None, AddrSpace.LOCAL, removable=removable)
         new_src = UOp(Ops.BUFFERIZE, s.dtype, src=(new_src,)+closed_ranges, arg=opts, tag=s.tag if opts.addrspace == AddrSpace.GLOBAL else None)
-        if x in ctx.range_map: new_src = new_src.index(*[r for i,r in enumerate(ctx.range_map[x][0]) if i in realized_ranges])
+        if x in ctx.range_map:
+          x_vmap = ctx.vmap_map.get(x, ())
+          # for VMAPOUT consuming a vmap-dependent source, get vmap ranges from VMAPOUT's out_rngs
+          if not x_vmap and s_vmap and x.op == Ops.VMAPOUT:
+            x_vmap = tuple(r for a,r in zip(x.src[1:], ctx.range_map[x][1]) if a.op == Ops.RANGE)
+          local_idx_rngs = tuple(r for i,r in enumerate(ctx.range_map[x][0]) if i in realized_ranges)
+          new_src = new_src.index(*x_vmap, *local_idx_rngs) if s_vmap else new_src.index(*local_idx_rngs)
     new_srcs.append(new_src)
   if x.op in GroupOp.VMap:
     # VMAPIN/OUT cannot follow an INDEX because INDEX doesn't have a shape, which breaks their spec
@@ -172,6 +183,20 @@ def run_rangeify(tsink:UOp, debug:bool=False) -> tuple[UOp, IndexingContext]:
   # get the consumer map
   with cpu_profile("consumer map in rangeify", "TINY"):
     consumer_map = consumer_map_from_toposort(tsink_toposort:=tsink.toposort())
+
+  # forward pass: propagate vmap dependency from VMAPIN to all dependent nodes
+  # nodes that transitively depend on a VMAPIN get the vmap ranges recorded
+  for x in tsink_toposort:
+    if x.op == Ops.VMAPIN:
+      rctx.vmap_map[x] = tuple(a for a in x.src[1:] if a.op == Ops.RANGE)
+    elif x.op == Ops.VMAPOUT:
+      # VMAPOUT already has vmap ranges in its out_rngs, don't propagate further
+      continue
+    else:
+      # inherit vmap ranges from sources (any source that has vmap dependency)
+      for s in x.src:
+        if s in rctx.vmap_map and x not in rctx.vmap_map:
+          rctx.vmap_map[x] = rctx.vmap_map[s]
 
   # explicit rangeify
   ending_ranges: dict[UOp, list[UOp]] = {}
