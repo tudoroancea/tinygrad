@@ -5,11 +5,16 @@ from tinygrad.dtype import dtypes, AddrSpace
 from tinygrad.uop.ops import PatternMatcher, UPat, Ops, UOp, resolve, GroupOp, graph_rewrite, sint, AxisType, profile_matches
 from tinygrad.uop.ops import consumer_map_from_toposort
 from tinygrad.uop.symbolic import symbolic, pm_simplify_valid, pm_drop_and_clauses
-from tinygrad.helpers import argsort, all_same, cpu_profile, PCONTIG, colored
+from tinygrad.helpers import argsort, all_same, cpu_profile, PCONTIG, colored, dedup
 
 ALWAYS_CONTIGUOUS: set[Ops] = {Ops.CONTIGUOUS, Ops.ASSIGN, Ops.COPY, Ops.BUFFER, Ops.BUFFER_VIEW,
                      Ops.CONST, Ops.BIND, Ops.DEVICE, Ops.MSELECT, Ops.MSTACK, Ops.DEFINE_GLOBAL,
                      Ops.DEFINE_LOCAL, Ops.DEFINE_REG, Ops.LOAD, Ops.KERNEL, Ops.ENCDEC}
+
+def merge_vmap_ranges(*ranges:tuple[UOp, ...]) -> tuple[UOp, ...]:
+  if not ranges: return ()
+  merged = dedup(itertools.chain.from_iterable(ranges))
+  return tuple(sorted(merged, key=lambda r: r.arg))
 
 def realize(ctx:dict[UOp, None], tr:UOp) -> None: ctx[tr] = None
 
@@ -67,9 +72,8 @@ def create_bufferize_and_index_based_on_ranges(ctx:IndexingContext, x:UOp):
       realized_ranges = ctx.realize_map[s]
       assert isinstance(realized_ranges, list), "realize map must contain range list"
       closed_ranges = tuple([r for i,r in enumerate(ctx.range_map[s][1]) if i in realized_ranges])
-      # for realized nodes inside a vmap scope (but not VMAPOUT itself), prepend vmap ranges
-      # so the intermediate buffer includes the batch dimension
-      s_vmap = ctx.vmap_map.get(s, ()) if s.op != Ops.VMAPOUT else ()
+      # for realized nodes inside a vmap scope, prepend vmap ranges so the intermediate buffer includes the batch dimension
+      s_vmap = ctx.vmap_map.get(s, ())
       closed_ranges = s_vmap + closed_ranges
       if s.op is Ops.STORE:
         # add the ends if this is a store
@@ -84,9 +88,10 @@ def create_bufferize_and_index_based_on_ranges(ctx:IndexingContext, x:UOp):
         new_src = UOp(Ops.BUFFERIZE, s.dtype, src=(new_src,)+closed_ranges, arg=opts, tag=s.tag if opts.addrspace == AddrSpace.GLOBAL else None)
         if x in ctx.range_map:
           x_vmap = ctx.vmap_map.get(x, ())
-          # for VMAPOUT consuming a vmap-dependent source, get vmap ranges from VMAPOUT's out_rngs
-          if not x_vmap and s_vmap and x.op == Ops.VMAPOUT:
-            x_vmap = tuple(r for a,r in zip(x.src[1:], ctx.range_map[x][1]) if a.op == Ops.RANGE)
+          # for VMAPOUT consuming a vmap-dependent source, include the VMAPOUT ranges used to reintroduce the vmap dimension
+          if s_vmap and x.op == Ops.VMAPOUT:
+            vmapout_ranges = tuple(r for a,r in zip(x.src[1:], ctx.range_map[x][1]) if a.op == Ops.RANGE)
+            if vmapout_ranges: x_vmap = merge_vmap_ranges(x_vmap, vmapout_ranges)
           local_idx_rngs = tuple(r for i,r in enumerate(ctx.range_map[x][0]) if i in realized_ranges)
           new_src = new_src.index(*x_vmap, *local_idx_rngs) if s_vmap else new_src.index(*local_idx_rngs)
     new_srcs.append(new_src)
@@ -188,15 +193,18 @@ def run_rangeify(tsink:UOp, debug:bool=False) -> tuple[UOp, IndexingContext]:
   # nodes that transitively depend on a VMAPIN get the vmap ranges recorded
   for x in tsink_toposort:
     if x.op == Ops.VMAPIN:
-      rctx.vmap_map[x] = tuple(a for a in x.src[1:] if a.op == Ops.RANGE)
+      src_vmap = rctx.vmap_map.get(x.src[0], ())
+      vmap_ranges = tuple(a for a in x.src[1:] if a.op == Ops.RANGE)
+      if (merged:=merge_vmap_ranges(src_vmap, vmap_ranges)): rctx.vmap_map[x] = merged
     elif x.op == Ops.VMAPOUT:
-      # VMAPOUT already has vmap ranges in its out_rngs, don't propagate further
-      continue
+      src_vmap = rctx.vmap_map.get(x.src[0], ())
+      if src_vmap:
+        vmapout_ranges = tuple(a for a in x.src[1:] if a.op == Ops.RANGE)
+        remaining = tuple(r for r in src_vmap if r not in vmapout_ranges)
+        if remaining: rctx.vmap_map[x] = remaining
     else:
-      # inherit vmap ranges from sources (any source that has vmap dependency)
-      for s in x.src:
-        if s in rctx.vmap_map and x not in rctx.vmap_map:
-          rctx.vmap_map[x] = rctx.vmap_map[s]
+      src_vmap = [rctx.vmap_map[s] for s in x.src if s in rctx.vmap_map]
+      if src_vmap: rctx.vmap_map[x] = merge_vmap_ranges(*src_vmap)
 
   # explicit rangeify
   ending_ranges: dict[UOp, list[UOp]] = {}

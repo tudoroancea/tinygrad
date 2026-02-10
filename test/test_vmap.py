@@ -312,5 +312,25 @@ class TestVmapCorrectness(unittest.TestCase):
     expected = 2 * x_np  # diagonal of diag(2*x) is just 2*x
     np.testing.assert_allclose(result.numpy(), expected, rtol=1e-5)
 
+  def test_nested_vmap_stack_scalar(self):
+    """Nested vmap + stack should preserve both outer and inner vmap ranges."""
+    np.random.seed(0)
+    z_np = np.random.randn(4, 5).astype(np.float32)
+    z = Tensor(z_np).realize()
+    r_inner = UOp.range(2, -1, AxisType.LOOP)
+    varg_inner = (UOp.const(dtypes.index, 0), r_inner)
+    def fn(row):
+      xv = row[:4].reshape(2, 2).vmapin(varg_inner)
+      g = row[4:]
+      y = xv * g
+      out = (g * Tensor.stack(y[0], y[1])).vmapout(varg_inner).flatten()
+      return out
+    result = _vmap_simple(fn, z, axis_id=-2)
+    expected = np.stack([
+      (z_np[b, :4].reshape(2, 2) * (z_np[b, 4] ** 2)).reshape(-1)
+      for b in range(z_np.shape[0])
+    ])
+    np.testing.assert_allclose(result.numpy(), expected, rtol=1e-5)
+
 if __name__ == '__main__':
   unittest.main()
