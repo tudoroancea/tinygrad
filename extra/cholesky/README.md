@@ -43,6 +43,7 @@ The dispatcher picks the fastest variant that fits the device and N.
 | `cholesky_v8.py` | v7 + blocked TRSM (small b_sub TRSMs + GEMMs) | splits the big TRSM but fires many kernels |
 | `cholesky_v9.py` | v7, but compute L_II⁻ᵀ once against I and matmul | replaces the M×b TRSM with a tiny b×b TRSM-vs-identity + big GEMM |
 | `cholesky_v10.py` | v9 + recursive 2×2 block inversion for L_II⁻ᵀ | base-case TRSM + matmul recursion — eliminates the last sequential hot spot |
+| `cholesky_v11.py` | v10 + Tensor.pad-based L assembly | replaces ~240 zero-fill kernels with pure movement ops; ~7-10% faster |
 
 All multi-kernel variants fall back to v5 when N is too small or not a
 multiple of the block size.
@@ -52,41 +53,46 @@ multiple of the block size.
 `extra/cholesky/__init__.py` exports `cholesky(A)` which picks:
 
 - `v1` for CPU / PYTHON.
-- `v5` for GPU with N < 256 or N not a multiple of 128.
-- `v10` for GPU with large, block-aligned N.
+- `v5` for GPU with N < 256 or N not a multiple of 64.
+- `v11` for GPU with large, block-aligned N.
 
 ## Bench
 
 ```
-DEV=NV  .venv/bin/python extra/cholesky/bench.py
-DEV=NV  VER=v5,v10,cusolver N=4096  .venv/bin/python extra/cholesky/bench.py
-DEV=CPU VER=v1,numpy                 .venv/bin/python extra/cholesky/bench.py
-JIT=0   DEV=NV VER=v7                 .venv/bin/python extra/cholesky/bench.py
+DEV=NV TC=1 BEAM=2 .venv/bin/python extra/cholesky/bench.py
+DEV=NV TC=1 BEAM=2 VER=v5,v11,cusolver N=4096 .venv/bin/python extra/cholesky/bench.py
+DEV=CPU VER=v1,numpy                          .venv/bin/python extra/cholesky/bench.py
+JIT=0  DEV=NV VER=v7                          .venv/bin/python extra/cholesky/bench.py
 ```
 
 Bench wraps each variant in `TinyJit` by default (set `JIT=0` to disable).
+`TC=1 BEAM=2` lets tinygrad's beam search pick optimised GEMM/TRSM kernels
+for the trailing-update matmuls — the first run takes a few minutes for
+the search, subsequent ones hit the diskcache.
+
 `VER=numpy` runs `np.linalg.cholesky`, `VER=cusolver` runs
 `torch.linalg.cholesky` on CUDA — that's cuSOLVER's `cusolverDnSpotrf` under
 the hood and is our dense-fp32 baseline on NVIDIA GPUs.
 
-### Reference numbers (NVIDIA, fp32, with TinyJit)
+### Reference numbers (NVIDIA RTX 5090, fp32, TinyJit + `TC=1 BEAM=2`)
 
-|         N | v1     | v5     | v7     | v9     | v10    | cuSOLVER | numpy |
-|----------:|-------:|-------:|-------:|-------:|-------:|---------:|------:|
-|        64 | 2.2 ms |   0.2 ms |   0.7 ms |   0.2 ms |   0.2 ms |   0.04 ms |  0.01 ms |
-|       256 |  160 ms |   1.7 ms |  10 ms |   1.7 ms |   1.7 ms |   0.13 ms |  0.3 ms |
-|      1024 |    — |  71 ms |  42 ms |  10 ms |   3.1 ms |   0.49 ms | 11.6 ms |
-|      4096 |    — |    — | 230 ms |  53 ms |  23 ms |   2.1 ms | 343 ms |
-|      8192 |    — |    — |    — |    — | 107 ms |   7.9 ms |    — |
+|        N | v5      | v10     | v11     | cuSOLVER | gap to cuSOLVER |
+|---------:|--------:|--------:|--------:|---------:|-----:|
+|     1024 |   71 ms |  3.1 ms |  1.5 ms |  0.49 ms |  3.1× |
+|     2048 |  428 ms |  7.4 ms |  3.6 ms |  1.01 ms |  3.5× |
+|     4096 | 3250 ms |   23 ms | 13.6 ms |  2.14 ms |  6.4× |
+|     8192 |    —    |  107 ms |   81 ms |  7.88 ms | 10.3× |
 
-"—" means the variant is too slow to be practical at that size.
+Throughput at N=4096:  v5 ~7 GFLOPS  →  v10 ~1 TFLOPS  →  v11 ~1.7 TFLOPS  →  cuSOLVER ~10.7 TFLOPS.
 
-Summary:
-- v1 → v5 is ~100× (same-structure, single-kernel parallelisation).
-- v5 → v10 is ~20× at N=4096 (multi-kernel blocking + tinygrad GEMMs).
-- v10 is still ~15× slower than cuSOLVER, which uses tensor-core cuBLAS GEMMs
-  and hand-tuned LAPACK-style blocking. tinygrad's default GEMMs do ~2 TFLOPS
-  on these shapes vs cuBLAS' ~20 TFLOPS with tensor cores.
+Summary of the ladder of speedups vs the trivial v1 single-thread Cholesky:
+- v1 → v5: ~100× (single-kernel parallelisation, 2-D thread tile).
+- v5 → v11: ~240× at N=4096 (multi-kernel blocking, recursive triangular
+  inverse, pad-based assembly, TinyJit + CUDA graphs).
+- v11 → cuSOLVER: ~6× at N=4096. The gap is the TF32 tensor cores: cuSOLVER
+  does its trailing-update matmuls on TF32 TC at >50 TFLOPS, our tinygrad
+  matmuls hit ~7 TFLOPS pure fp32. ALLOW_TF32=1 puts TF32 TC into BEAM's
+  action set, but BEAM's wall-clock budget hasn't picked it as a winner here.
 
 ## Tests
 
@@ -112,7 +118,18 @@ GPU-only variants skip cleanly on backends without LOCAL memory support.
   `blocked_cholesky`, `for I in range(NB): L = ... (tinygrad ops) ...`
   never calls `.realize()`. The entire graph is scheduled together; with
   `TinyJit` the Python loop runs once and subsequent calls hit the compiled
-  dispatch table.
+  dispatch table — and tinygrad batches consecutive kernels into CUDA
+  graphs automatically (you can see `JIT GRAPHing batch with N kernels`
+  in the debug log).
+- **BEAM works on tinygrad-emitted matmuls but not on our custom kernels.**
+  `Tensor.__matmul__` produces an `Ops.REDUCE` AST that BEAM can re-tile
+  with UPCAST/UNROLL/LOCAL/SWAP/THREAD/TC. Our custom Cholesky/TRSM kernels
+  carry `opts_to_apply=()` to disable BEAM because BEAM's `GROUP` opt
+  re-parallelises our REDUCE axes (which we use as sequential loops),
+  silently breaking correctness. A BEAM-able Cholesky would need an
+  algorithm that's actually reducible, which Cholesky's left/right-looking
+  isn't — the j and i loops carry true dependencies.
+
 - **Edge cases hit while building this:**
   - Dynamic `UOp.range(j, …)` bounds crash `simplify_merge_adjacent` on
     same-type adjacent axes (the merged bound references the substituted
@@ -124,3 +141,16 @@ GPU-only variants skip cleanly on backends without LOCAL memory support.
   - `Ops.REDUCE` with a trivial range (N=1) trips `reduce_unparented`'s
     `all(x.op is Ops.RANGE for x in ...)` assertion — special-cased in
     v2/v3/v4/v5 with a direct sqrt.
+
+## Where the remaining gap to cuSOLVER comes from
+
+After v11 + BEAM, profiling at N=4096 (13.6 ms total GPU time) shows:
+- big trailing-update matmuls reach ~7 TFLOPS (the BEAM-tiled `r_…` kernels
+  hit close to fp32 peak on this GPU).
+- Most time is in **the 64 small `cholesky_v5_64` calls** factoring the
+  diagonal blocks (~2.7 ms) and **125 base-case 32×32 TRSM kernels** for
+  the recursive inverse (~2.5 ms). These two groups together are >40% of
+  GPU time and are barrier-bound, not compute-bound.
+- cuSOLVER is faster mainly because cuBLAS-with-TF32 hits ~50 TFLOPS on the
+  trailing matmuls (vs our 7) and the diagonal-block factor is fused
+  in-shared-memory.

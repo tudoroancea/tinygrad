@@ -18,7 +18,8 @@ from .cholesky_v5  import cholesky as _v5
 from .cholesky_v7  import cholesky as _v7   # noqa: F401
 from .cholesky_v8  import cholesky as _v8   # noqa: F401
 from .cholesky_v9  import cholesky as _v9   # noqa: F401
-from .cholesky_v10 import cholesky as _v10
+from .cholesky_v10 import cholesky as _v10    # noqa: F401
+from .cholesky_v11 import cholesky as _v11
 
 
 def _has_local(device: str) -> bool:
@@ -33,6 +34,6 @@ def cholesky(A: Tensor) -> Tensor:
   dev = A.device if isinstance(A.device, str) else A.device[0]
   if not _has_local(dev):
     return _v1(A)                           # CPU / PYTHON
-  if N < 256 or N % 128 != 0:
+  if N < 256 or N % 64 != 0:
     return _v5(A)                           # small square: 1-kernel version has no launch overhead
-  return _v10(A)                            # big square: multi-kernel blocked Cholesky
+  return _v11(A)                            # big square: blocked Cholesky with pad-based assembly

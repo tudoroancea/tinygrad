@@ -107,6 +107,15 @@ class TestCholeskyV10(unittest.TestCase):
     for N in (256, 512, 1024): _check(self.chol, N)
 
 
+class TestCholeskyV11(unittest.TestCase):
+  chol = staticmethod(_load("v11"))
+  def test_sizes(self):
+    from tinygrad.device import Device
+    if not getattr(Device[Tensor.empty(1).device].renderer, "has_local", False):
+      self.skipTest("v11 needs LOCAL memory support")
+    for N in (256, 512, 1024): _check(self.chol, N)
+
+
 class TestDispatcher(unittest.TestCase):
   def test_picks_working_kernel(self):
     from extra.cholesky import cholesky as dispatch

@@ -12,7 +12,7 @@ import os, importlib, time, numpy as np
 from tinygrad import Tensor, GlobalCounters, Context, TinyJit
 from tinygrad.device import Device
 
-VERSIONS = ("v1", "v3", "v4", "v5", "v7", "v8", "v9", "v10", "cusolver", "numpy")
+VERSIONS = ("v1", "v3", "v4", "v5", "v7", "v8", "v9", "v10", "v11", "cusolver", "numpy")
 SIZES_DEFAULT = (64, 128, 256, 512, 1024)
 
 
