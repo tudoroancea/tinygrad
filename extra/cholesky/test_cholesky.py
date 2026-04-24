@@ -80,6 +80,33 @@ class TestCholeskyV5(unittest.TestCase):
     for N in (1, 16, 32, 64, 128, 256): _check(self.chol, N)
 
 
+class TestCholeskyV7(unittest.TestCase):
+  chol = staticmethod(_load("v7"))
+  def test_sizes(self):
+    from tinygrad.device import Device
+    if not getattr(Device[Tensor.empty(1).device].renderer, "has_local", False):
+      self.skipTest("v7 needs LOCAL memory support")
+    for N in (128, 256, 512): _check(self.chol, N)
+
+
+class TestCholeskyV9(unittest.TestCase):
+  chol = staticmethod(_load("v9"))
+  def test_sizes(self):
+    from tinygrad.device import Device
+    if not getattr(Device[Tensor.empty(1).device].renderer, "has_local", False):
+      self.skipTest("v9 needs LOCAL memory support")
+    for N in (256, 512, 1024): _check(self.chol, N)
+
+
+class TestCholeskyV10(unittest.TestCase):
+  chol = staticmethod(_load("v10"))
+  def test_sizes(self):
+    from tinygrad.device import Device
+    if not getattr(Device[Tensor.empty(1).device].renderer, "has_local", False):
+      self.skipTest("v10 needs LOCAL memory support")
+    for N in (256, 512, 1024): _check(self.chol, N)
+
+
 class TestDispatcher(unittest.TestCase):
   def test_picks_working_kernel(self):
     from extra.cholesky import cholesky as dispatch

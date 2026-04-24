@@ -9,10 +9,10 @@ just the kernel time (not Python overhead or dispatch).
 """
 from __future__ import annotations
 import os, importlib, time, numpy as np
-from tinygrad import Tensor, GlobalCounters, Context
+from tinygrad import Tensor, GlobalCounters, Context, TinyJit
 from tinygrad.device import Device
 
-VERSIONS = ("v1", "v3", "v4", "v5", "numpy")
+VERSIONS = ("v1", "v3", "v4", "v5", "v7", "v8", "v9", "v10", "cusolver", "numpy")
 SIZES_DEFAULT = (64, 128, 256, 512, 1024)
 
 
@@ -44,9 +44,36 @@ def _run_numpy(sizes, warmup: int = 1, iters: int = 3):
     print(f"[NPY] numpy N={N:5d}  t={best*1e3:8.2f} ms  {gflops:8.2f} GFLOPS")
 
 
+def _run_cusolver(sizes, warmup: int = 1, iters: int = 3):
+  try:
+    import torch
+    assert torch.cuda.is_available()
+  except Exception as e:
+    print(f"(skipping cusolver: {e})")
+    return
+  for N in sizes:
+    A_np = spd(N)
+    A_cuda = torch.from_numpy(A_np).cuda()
+    for _ in range(warmup): torch.linalg.cholesky(A_cuda)
+    torch.cuda.synchronize()
+    ets = []
+    for _ in range(iters):
+      t0 = time.perf_counter()
+      L = torch.linalg.cholesky(A_cuda)
+      torch.cuda.synchronize()
+      ets.append(time.perf_counter() - t0)
+    flops = (N**3) / 3.0
+    best = min(ets)
+    gflops = flops / best / 1e9 if best > 0 else float("nan")
+    print(f"[cuSOLVER] N={N:5d}  t={best*1e3:8.2f} ms  {gflops:8.2f} GFLOPS")
+
+
 def run_variant(name: str, sizes, warmup: int = 1, iters: int = 3):
   if name == "numpy":
     return _run_numpy(sizes, warmup, iters)
+  if name == "cusolver":
+    return _run_cusolver(sizes, warmup, iters)
+  use_jit = bool(int(os.environ.get("JIT", "1")))
   chol = load_variant(name)
   limit = MAX_N.get(name, 10**9)
   for N in sizes:
@@ -58,24 +85,35 @@ def run_variant(name: str, sizes, warmup: int = 1, iters: int = 3):
 
     ets: list[float] = []
     last_L = None
-    # separate Tensor each iteration so the scheduler doesn't reuse results
-    for i in range(warmup + iters):
-      A = Tensor(A_np).realize()
-      Device[A.device].synchronize()
-      t0 = time.perf_counter()
-      with Context(DEBUG=0):
-        L = chol(A).realize()
-      Device[A.device].synchronize()
-      t1 = time.perf_counter()
-      if i >= warmup: ets.append(t1 - t0)
-      last_L = L
+    # Build a JIT wrapper so per-call Python dispatch doesn't dominate for blocked variants.
+    A_fixed = Tensor(A_np).realize()
+    if use_jit:
+      jitted = TinyJit(lambda a: chol(a).realize())
+      for _ in range(max(2, warmup)):
+        jitted(A_fixed); Device[A_fixed.device].synchronize()
+      for _ in range(iters):
+        t0 = time.perf_counter()
+        last_L = jitted(A_fixed)
+        Device[A_fixed.device].synchronize()
+        ets.append(time.perf_counter() - t0)
+    else:
+      for i in range(warmup + iters):
+        A = Tensor(A_np).realize()
+        Device[A.device].synchronize()
+        t0 = time.perf_counter()
+        with Context(DEBUG=0):
+          L = chol(A).realize()
+        Device[A.device].synchronize()
+        t1 = time.perf_counter()
+        if i >= warmup: ets.append(t1 - t0)
+        last_L = L
     L_np = last_L.numpy()
     err = float(np.abs(L_np - ref).max())
 
     flops = (N**3) / 3.0
     best = min(ets)
     gflops = flops / best / 1e9 if best > 0 else float("nan")
-    tag = os.environ.get("DEV", A.device)
+    tag = os.environ.get("DEV", A_fixed.device)
     print(f"[{tag}] {name}  N={N:5d}  t={best*1e3:8.2f} ms  {gflops:8.2f} GFLOPS  err={err:.2e}")
 
 
