@@ -76,14 +76,14 @@ the hood and is our dense-fp32 baseline on NVIDIA GPUs.
 
 ### Reference numbers (NVIDIA RTX 5090, fp32, TinyJit + `TC=1 BEAM=2`)
 
-|        N | v5      | v10     | v11     | cuSOLVER | gap to cuSOLVER |
-|---------:|--------:|--------:|--------:|---------:|-----:|
-|     1024 |   71 ms |  3.1 ms |  1.5 ms |  0.49 ms |  3.1× |
-|     2048 |  428 ms |  7.4 ms |  3.6 ms |  1.01 ms |  3.5× |
-|     4096 | 3250 ms |   23 ms | 13.6 ms |  2.14 ms |  6.4× |
-|     8192 |    —    |  107 ms |   81 ms |  7.88 ms | 10.3× |
+|        N | v5       | v9       | v10      | v11      | cuSOLVER | gap |
+|---------:|---------:|---------:|---------:|---------:|---------:|----:|
+|     1024 |   71 ms  |  9.4 ms  |  3.1 ms  |  1.5 ms  |  0.49 ms |  3.1× |
+|     2048 |  426 ms  |   22 ms  |  5.7 ms  |  3.6 ms  |  1.01 ms |  3.5× |
+|     4096 | 3250 ms  |   51 ms  |   23 ms  | 13.6 ms  |  2.14 ms |  6.4× |
+|     8192 |    —     |    —     |   87 ms  |   83 ms  |  7.83 ms | 10.6× |
 
-Throughput at N=4096:  v5 ~7 GFLOPS  →  v10 ~1 TFLOPS  →  v11 ~1.7 TFLOPS  →  cuSOLVER ~10.7 TFLOPS.
+Throughput at N=4096: v5 ~7 GFLOPS → v9 ~450 → v10 ~580 → v11 ~1.7 TFLOPS → cuSOLVER ~10.7 TFLOPS.
 
 Summary of the ladder of speedups vs the trivial v1 single-thread Cholesky:
 - v1 → v5: ~100× (single-kernel parallelisation, 2-D thread tile).
